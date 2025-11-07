@@ -16,9 +16,10 @@ const LiveScoring = () => {
   const [logoFolderPath, setLogoFolderPath] = useState(''); // Logo folder path
   const [hpFolderPath, setHpFolderPath] = useState(''); // NEW: HP images folder path
   const safeZoneTriggeredRef = useRef(new Set());
-  const SAFE_ZONE_API_URL = 'http://192.168.110.12:8088/api/?Function=SetImageVisible&Input=1&SelectedName=ZONE1.Source&Value=true';
-
-  const VMIX_BASE_URL = 'http://192.168.110.12:8088/api/?Function=SetImageVisible&Input=1';
+  const zoneVisibilityCache = useRef(new Map());
+  const VMIX_INPUT_NAME = 'ALIVE STATUS';
+  const VMIX_BASE_URL = `http://192.168.110.12:8088/api/?Function=SetImageVisible&Input=${encodeURIComponent(VMIX_INPUT_NAME)}`;
+  const SAFE_ZONE_API_URL = `${VMIX_BASE_URL}&SelectedName=ZONE1.Source&Value=true`;
 
   const getVmixZoneName = (teamKey) => {
     if (teamKey === undefined || teamKey === null) return null;
@@ -30,13 +31,44 @@ const LiveScoring = () => {
   };
 
   const setZoneVisibility = async (zoneName, visible) => {
+    const cache = zoneVisibilityCache.current;
+    if (cache.get(zoneName) === visible) {
+      return;
+    }
+
     const url = `${VMIX_BASE_URL}&SelectedName=${zoneName}.Source&Value=${visible}`;
     try {
       await fetch(url);
+      cache.set(zoneName, visible);
       console.log(`vMix ${zoneName} → ${visible}`);
     } catch (err) {
       console.error('Failed updating vMix visibility', err);
     }
+  };
+
+  const resetAllZones = async () => {
+    const cache = zoneVisibilityCache.current;
+    const knownZones = new Set(cache.keys());
+
+    const manualTeamCount = teamNamesInput
+      .split('\n')
+      .map((name) => name.trim())
+      .filter((name) => name.length > 0).length;
+
+    const zoneCount = Math.max(manualTeamCount, knownZones.size);
+    for (let i = 1; i <= zoneCount; i += 1) {
+      const zoneName = getVmixZoneName(i);
+      if (zoneName) {
+        knownZones.add(zoneName);
+      }
+    }
+
+    cache.clear();
+
+    const zoneList = Array.from(knownZones);
+    if (!zoneList.length) return;
+
+    await Promise.all(zoneList.map((zoneName) => setZoneVisibility(zoneName, true)));
   };
 
 
@@ -80,6 +112,8 @@ const LiveScoring = () => {
     setLoading(true);
     setError(null);
     setIsInitialLoad(true);
+
+    await resetAllZones();
 
     try {
       const response = await fetch(
