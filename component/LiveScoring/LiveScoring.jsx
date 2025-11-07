@@ -167,7 +167,8 @@ const LiveScoring = () => {
 
     // Generate Zone image paths (ZONE1, ZONE2, ...) - positioned before win rates
     sortedTeams.forEach((team, index) => {
-      const anyPlayerOutside = team.player_stats?.some((player) => player.is_in_safe_zone === false);
+      const relevantPlayers = (team.player_stats || []).filter((player) => player?.player_state !== 1);
+      const anyPlayerOutside = relevantPlayers.some((player) => player.is_in_safe_zone === false);
       jsonData[`ZONE${index + 1}`] = anyPlayerOutside ? zoneOut || '' : zoneIn || '';
     });
 
