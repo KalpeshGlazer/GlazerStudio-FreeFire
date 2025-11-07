@@ -13,12 +13,10 @@ const LiveScoring = () => {
   const [teamNamesInput, setTeamNamesInput] = useState('Team 1\nTeam 2\nTeam 3');
   const [jsonFilePath, setJsonFilePath] = useState(''); // File path state
   const [jsonWriteStatus, setJsonWriteStatus] = useState(null); // Status for JSON writing
-  const [logoFolderPath, setLogoFolderPath] = useState(''); // Logo folder path
-  const [hpFolderPath, setHpFolderPath] = useState(''); // NEW: HP images folder path
-  const [zoneInImage, setZoneInImage] = useState('');
-  const [zoneOutImage, setZoneOutImage] = useState('');
-
-
+  const [logoFolderPath, setLogoFolderPath] = useState('D:\\Production Assets\\team logos'); // Logo folder path
+  const [hpFolderPath, setHpFolderPath] = useState('D:\\Production Assets\\Alive health pins'); // NEW: HP images folder path
+  const [zoneInImage, setZoneInImage] = useState('D:\\Production Assets\\INZONE\\100001.png');
+  const [zoneOutImage, setZoneOutImage] = useState('D:\\Production Assets\\OUTZONE\\100001.png');
 
 
   // Silent background update function (no loading state)
@@ -148,12 +146,13 @@ const LiveScoring = () => {
     sortedTeams.forEach((team, index) => {
       const teamName = team.team_name || `Team ${index + 1}`;
       const position = index + 1;
-      
+
       if (logoFolderPath.trim()) {
         // Normalize team name for file path (remove spaces, special chars)
         const normalizedTeamName = teamName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-        // Construct logo path: folderPath/teamname.png
-        const logoPath = `${logoFolderPath.replace(/\/$/, '')}/${normalizedTeamName}.png`;
+        const basePath = logoFolderPath.replace(/[\\/]+$/, '');
+        const separator = basePath.includes('\\') ? '\\' : '/';
+        const logoPath = `${basePath}${separator}${normalizedTeamName}.png`;
         jsonData[`Logo${position}`] = logoPath;
       } else {
         jsonData[`Logo${position}`] = '';
@@ -166,17 +165,17 @@ const LiveScoring = () => {
       jsonData[`FIN${position}`] = team.totalKills || 0;
     });
 
-    // Generate Zone image paths (Zone1, Zone2, ...) - positioned before win rates
+    // Generate Zone image paths (ZONE1, ZONE2, ...) - positioned before win rates
     sortedTeams.forEach((team, index) => {
       const anyPlayerOutside = team.player_stats?.some((player) => player.is_in_safe_zone === false);
-      jsonData[`Zone${index + 1}`] = anyPlayerOutside ? zoneOut || '' : zoneIn || '';
+      jsonData[`ZONE${index + 1}`] = anyPlayerOutside ? zoneOut || '' : zoneIn || '';
     });
 
     // Generate Win Rates (WinRate1, WinRate2, ...)
     sortedTeams.forEach((team, index) => {
       const position = index + 1;
       const winRate = team.win_rate ?? 0;
-      jsonData[`WinRate${position}`] = typeof winRate === 'number' ? winRate : parseFloat(winRate) || 0;
+      jsonData[`WINRATE${position}`] = typeof winRate === 'number' ? winRate : parseFloat(winRate) || 0;
     });
 
     // Generate HP IMAGE PATHS for each team (only include existing players)
@@ -205,8 +204,10 @@ const LiveScoring = () => {
             if (player.player_state === 2) {
               hpValue = -playerHP; // Make it negative for knockdown
             }
-            
-            const hpImagePath = `${hpFolderPath.replace(/\/$/, '')}/${hpValue}.png`;
+
+            const basePath = hpFolderPath.replace(/[\\/]+$/, '');
+            const separator = basePath.includes('\\') ? '\\' : '/';
+            const hpImagePath = `${basePath}${separator}${hpValue}.png`;
             jsonData[`T${teamNumber}P${playerNumber}`] = hpImagePath;
             console.log(`Set T${teamNumber}P${playerNumber} to:`, hpImagePath, `(player_state: ${player.player_state})`);
           } else {
@@ -407,7 +408,9 @@ const LiveScoring = () => {
     // Normalize team name for file path (remove spaces, special chars)
     const normalizedTeamName = teamName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
     // Construct logo path: folderPath/teamname.png
-    const logoPath = `${logoFolderPath.replace(/\/$/, '')}/${normalizedTeamName}.png`;
+    const basePath = logoFolderPath.replace(/[\\/]+$/, '');
+    const separator = basePath.includes('\\') ? '\\' : '/';
+    const logoPath = `${basePath}${separator}${normalizedTeamName}.png`;
     console.log('Generated logo path:', logoPath, 'for team:', teamName);
     return logoPath;
   };
