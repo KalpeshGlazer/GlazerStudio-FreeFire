@@ -1,6 +1,50 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+
+const sanitizeGroupName = (name) => {
+  if (typeof name !== 'string') return '';
+  return name.trim();
+};
+
+const sanitizeFileName = (value, fallback = 'match-summary') => {
+  if (typeof value !== 'string') return fallback;
+  const cleaned = value.trim().replace(/[^a-zA-Z0-9-_]+/g, '_');
+  return cleaned || fallback;
+};
+
+const sanitizeLabel = (value, fallback = '') => {
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  return trimmed || fallback;
+};
+
+const DEFAULT_GROUP_NAME = 'GroupA';
+const DEFAULT_ROUND_LABEL = 'R1';
+const DEFAULT_MATCH_LABEL = 'M1';
+
+const incrementMatchLabel = (label) => {
+  const sanitized = sanitizeLabel(label, DEFAULT_MATCH_LABEL) || DEFAULT_MATCH_LABEL;
+  const match = sanitized.match(/^([^\d]*)(\d+)?$/);
+
+  if (!match) {
+    return DEFAULT_MATCH_LABEL;
+  }
+
+  const prefix = match[1] || 'M';
+  const numericPart = match[2];
+  const nextNumber = numericPart ? parseInt(numericPart, 10) + 1 : 2;
+  const padded =
+    numericPart && numericPart.length > 1
+      ? String(nextNumber).padStart(numericPart.length, '0')
+      : String(nextNumber);
+
+  return `${prefix}${padded}`;
+};
+
+const buildMatchCompositeKey = (group, round, match) => {
+  return [group, round, match].map((value) => sanitizeFileName(value || '')).join('::');
+};
 import TeamCard from './TeamCard';
 
 const LiveScoring = () => {
@@ -17,6 +61,101 @@ const LiveScoring = () => {
   const [hpFolderPath, setHpFolderPath] = useState('D:\\Production Assets\\Alive health pins'); // NEW: HP images folder path
   const [zoneInImage, setZoneInImage] = useState('D:\\Production Assets\\INZONE\\100001.png');
   const [zoneOutImage, setZoneOutImage] = useState('D:\\Production Assets\\OUTZONE\\100001.png');
+  const [cumulativeScores, setCumulativeScores] = useState({});
+  const [matchHistory, setMatchHistory] = useState([]);
+  const [matchSaveStatus, setMatchSaveStatus] = useState(null);
+  const [groupName, setGroupName] = useState(DEFAULT_GROUP_NAME);
+  const [groupDataMap, setGroupDataMap] = useState(() => ({
+    [DEFAULT_GROUP_NAME]: {
+      cumulativeScores: {},
+      matchHistory: [],
+      roundLabel: DEFAULT_ROUND_LABEL,
+      matchLabel: DEFAULT_MATCH_LABEL,
+    },
+  }));
+  const [roundLabel, setRoundLabel] = useState(DEFAULT_ROUND_LABEL);
+  const [matchLabel, setMatchLabel] = useState(DEFAULT_MATCH_LABEL);
+
+  const persistGroupData = useCallback(
+    (groupKey, payload) => {
+      const normalized = sanitizeGroupName(groupKey);
+      if (!normalized || !payload || typeof payload !== 'object') {
+        return;
+      }
+
+      setGroupDataMap((prev) => {
+        const existing = prev?.[normalized] || {};
+        const merged = {
+          ...existing,
+          ...payload,
+        };
+
+        try {
+          if (JSON.stringify(existing) === JSON.stringify(merged)) {
+            return prev;
+          }
+        } catch (err) {
+          // If serialization fails, continue with update.
+          console.error('Failed to compare group data payloads:', err);
+        }
+
+        return {
+          ...prev,
+          [normalized]: merged,
+        };
+      });
+    },
+    [setGroupDataMap]
+  );
+
+  const handleActiveGroupChange = useCallback(
+    (value) => {
+      const cleanValue = sanitizeGroupName(value);
+      setGroupName(cleanValue);
+
+      if (!cleanValue) {
+        setCumulativeScores({});
+        setMatchHistory([]);
+        setRoundLabel(DEFAULT_ROUND_LABEL);
+        setMatchLabel(DEFAULT_MATCH_LABEL);
+        return;
+      }
+
+      const payload = groupDataMap?.[cleanValue];
+
+      if (payload) {
+        const nextHistory = Array.isArray(payload.matchHistory) ? payload.matchHistory : [];
+        const recalculated = recalculateCumulativeFromHistory(nextHistory);
+        const nextScores =
+          recalculated && Object.keys(recalculated).length > 0
+            ? recalculated
+            : payload.cumulativeScores && typeof payload.cumulativeScores === 'object'
+            ? payload.cumulativeScores
+            : {};
+        const nextRound =
+          sanitizeLabel(payload.roundLabel, DEFAULT_ROUND_LABEL) || DEFAULT_ROUND_LABEL;
+        const nextMatch =
+          sanitizeLabel(payload.matchLabel, DEFAULT_MATCH_LABEL) || DEFAULT_MATCH_LABEL;
+
+        setCumulativeScores(nextScores);
+        setMatchHistory(nextHistory);
+        setRoundLabel(nextRound);
+        setMatchLabel(nextMatch);
+      } else {
+        setCumulativeScores({});
+        setMatchHistory([]);
+        setRoundLabel(DEFAULT_ROUND_LABEL);
+        setMatchLabel(DEFAULT_MATCH_LABEL);
+        persistGroupData(cleanValue, {
+          cumulativeScores: {},
+          matchHistory: [],
+          roundLabel: DEFAULT_ROUND_LABEL,
+          matchLabel: DEFAULT_MATCH_LABEL,
+        });
+      }
+    },
+    [groupDataMap, persistGroupData]
+  );
 
 
   // Silent background update function (no loading state)
@@ -114,22 +253,99 @@ const LiveScoring = () => {
 
   // NEW: Function to generate vMix-compatible JSON
   const generateVmixJson = () => {
-    // Calculate teams inside this function to avoid initialization issues
     const currentTeams = getFilteredTeams();
 
     if (!liveData || !currentTeams.length) return null;
 
-    // Calculate total kills for each team and sort by kills (highest first)
-    const teamsWithKills = currentTeams.map(team => {
-      const totalKills = team.player_stats?.reduce((sum, player) => sum + (player.kills || 0), 0) || team.kill_count || 0;
+    const scoreEntries = cumulativeScores && typeof cumulativeScores === 'object' ? cumulativeScores : {};
+
+    const findCumulativeEntryForTeam = (team) => {
+      if (!team) return null;
+
+      const attempts = [];
+      const name = typeof team.team_name === 'string' ? team.team_name.trim() : '';
+      if (name) {
+        attempts.push(name, name.toLowerCase());
+      }
+
+      const teamId = team.team_id ?? team.assigned_id ?? team.id;
+      if (teamId !== null && teamId !== undefined) {
+        const idString = String(teamId).trim();
+        if (idString) {
+          attempts.push(idString, `team-${idString}`, `Team ${idString}`);
+        }
+      }
+
+      for (const key of attempts) {
+        if (!key) continue;
+        if (scoreEntries[key]) {
+          return scoreEntries[key];
+        }
+      }
+
+      if (name) {
+        const normalized = name.toLowerCase();
+        const matched = Object.entries(scoreEntries).find(([key, value]) => {
+          const candidates = [];
+          if (typeof key === 'string') {
+            candidates.push(key.trim().toLowerCase());
+          }
+          if (value && typeof value.teamName === 'string') {
+            candidates.push(value.teamName.trim().toLowerCase());
+          }
+          return candidates.some((candidate) => candidate === normalized);
+        });
+
+        if (matched) {
+          return matched[1];
+        }
+      }
+
+      return null;
+    };
+
+    const resolvePreviousTotalPoints = (entry) => {
+      if (!entry || typeof entry !== 'object') return 0;
+      const previous = Number(entry.previousTotalPoints);
+      if (Number.isFinite(previous) && previous >= 0) {
+        return previous;
+      }
+      const total = Number(entry.totalPoints);
+      if (Number.isFinite(total) && total >= 0) {
+        return total;
+      }
+      return 0;
+    };
+
+    const teamsWithStats = currentTeams.map((team) => {
+      const totalKills =
+        (Array.isArray(team.player_stats)
+          ? team.player_stats.reduce((sum, player) => sum + (Number(player.kills) || 0), 0)
+          : 0) || Number(team.kill_count) || 0;
+
+      const { killPoints, placementPoints, totalPoints: currentMatchTotal } = calculateTeamPoints(team);
+      const cumulativeEntry = findCumulativeEntryForTeam(team);
+      const previousTotal = resolvePreviousTotalPoints(cumulativeEntry);
+      const safeCurrentTotal = Number.isFinite(currentMatchTotal) ? currentMatchTotal : 0;
+      const combinedTotal = previousTotal + safeCurrentTotal;
+
       return {
         ...team,
-        totalKills: totalKills
+        totalKills,
+        killPoints,
+        placementPoints,
+        currentMatchTotalPoints: safeCurrentTotal,
+        previousTotalPoints: previousTotal,
+        combinedTotalPoints: Number.isFinite(combinedTotal) ? combinedTotal : 0,
       };
     });
 
-    // Sort teams by kills (highest first)
-    const sortedTeams = [...teamsWithKills].sort((a, b) => b.totalKills - a.totalKills);
+    // Sort teams by combined total points (previous cumulative + current match), break ties by kills
+    const sortedTeams = [...teamsWithStats].sort((a, b) => {
+      const diff = (b.combinedTotalPoints || 0) - (a.combinedTotalPoints || 0);
+      if (diff !== 0) return diff;
+      return (b.totalKills || 0) - (a.totalKills || 0);
+    });
 
     const jsonData = {};
     const zoneIn = zoneInImage.trim();
@@ -163,6 +379,15 @@ const LiveScoring = () => {
     sortedTeams.forEach((team, index) => {
       const position = index + 1;
       jsonData[`FIN${position}`] = team.totalKills || 0;
+    });
+
+    // Generate Total points (Total1, Total2, Total3) - previous + current match
+    sortedTeams.forEach((team, index) => {
+      const position = index + 1;
+      const totalPointsValue = Number.isFinite(team.combinedTotalPoints)
+        ? Math.round(team.combinedTotalPoints)
+        : 0;
+      jsonData[`Total${position}`] = totalPointsValue;
     });
 
     // Generate Zone image paths (ZONE1, ZONE2, ...) - positioned before win rates
@@ -416,10 +641,693 @@ const LiveScoring = () => {
     return logoPath;
   };
 
+  const calculateTeamPoints = (team) => {
+    const killsFromPlayers = Array.isArray(team.player_stats)
+      ? team.player_stats.reduce((sum, player) => sum + (Number(player.kills) || 0), 0)
+      : 0;
+
+    const killCountValue = Number(team.kill_count);
+    const killPoints = Number.isFinite(killCountValue) ? killCountValue : killsFromPlayers;
+
+    const placementCandidates = [
+      team.ranking_score,
+      team.rank_points,
+      team.placement_points,
+      team.position_points,
+    ];
+
+    const placementPointsCandidate = placementCandidates
+      .map((value) => {
+        const numeric = Number(value);
+        return Number.isFinite(numeric) ? numeric : null;
+      })
+      .find((value) => value !== null);
+
+    let placementPoints = placementPointsCandidate ?? 0;
+
+    const totalCandidates = [
+      team.total_points,
+      team.total_score,
+      team.points,
+      team.score,
+    ];
+
+    const providedTotal = totalCandidates
+      .map((value) => {
+        const numeric = Number(value);
+        return Number.isFinite(numeric) ? numeric : null;
+      })
+      .find((value) => value !== null);
+
+    let totalPoints;
+    if (providedTotal !== null && providedTotal !== undefined) {
+      totalPoints = providedTotal;
+      if ((!placementPoints || placementPoints === 0) && killPoints !== undefined) {
+        const derivedPlacement = providedTotal - (Number.isFinite(killPoints) ? killPoints : 0);
+        placementPoints = Number.isFinite(derivedPlacement) ? Math.max(0, derivedPlacement) : 0;
+      }
+    } else {
+      totalPoints = (Number.isFinite(killPoints) ? killPoints : 0) + placementPoints;
+    }
+
+    return {
+      killPoints: Number.isFinite(killPoints) ? killPoints : 0,
+      placementPoints: Number.isFinite(placementPoints) ? placementPoints : 0,
+      totalPoints: Number.isFinite(totalPoints) ? totalPoints : 0,
+    };
+  };
+
+  const isBooyahTeam = (team) => {
+    if (!team) return false;
+    if (team.booyah !== undefined) return Boolean(team.booyah);
+
+    const rankCandidates = [
+      team.rank_position,
+      team.rank,
+      team.placement,
+      team.position,
+      team.ranking,
+    ];
+
+    return rankCandidates
+      .map((value) => Number(value))
+      .some((numeric) => Number.isFinite(numeric) && numeric === 1);
+  };
+
+  const buildMatchSummary = () => {
+    const currentTeams = getFilteredTeams();
+    if (!currentTeams.length) return [];
+
+    return currentTeams.map((team) => {
+      const { killPoints, placementPoints, totalPoints } = calculateTeamPoints(team);
+      const teamId = team.team_id ?? team.assigned_id ?? team.id ?? null;
+      const defaultName = teamId !== null ? `Team ${teamId}` : 'Unknown Team';
+
+      return {
+        teamId,
+        teamName: team.team_name || defaultName,
+        killPoints,
+        placementPoints,
+        totalPoints,
+        booyah: isBooyahTeam(team),
+        raw: team,
+      };
+    });
+  };
+
+  const recalculateCumulativeFromHistory = (history) => {
+    if (!Array.isArray(history) || history.length === 0) {
+      return {};
+    }
+
+    const aggregate = {};
+
+    const sortedHistory = [...history].sort((a, b) => {
+      const timeA = new Date(a?.savedAt || 0).getTime();
+      const timeB = new Date(b?.savedAt || 0).getTime();
+      return timeA - timeB;
+    });
+
+    sortedHistory.forEach((entry) => {
+      if (!entry || typeof entry !== 'object') return;
+
+      const timestamp = entry.savedAt;
+      const matchIdentifier = entry.matchId || entry.matchIdentifier || entry.matchKey || null;
+      const teams = Array.isArray(entry.teams) ? entry.teams : [];
+
+      teams.forEach((teamSummary) => {
+        const key =
+          teamSummary.teamName ||
+          (teamSummary.teamId !== null && teamSummary.teamId !== undefined
+            ? `team-${teamSummary.teamId}`
+            : null);
+
+        if (!key) return;
+
+        const baseName =
+          teamSummary.teamName ||
+          (teamSummary.teamId !== null && teamSummary.teamId !== undefined
+            ? `Team ${teamSummary.teamId}`
+            : 'Unknown Team');
+
+        const existing = aggregate[key] || {
+          teamId: teamSummary.teamId,
+          teamName: baseName,
+          matches: 0,
+          killPoints: 0,
+          placementPoints: 0,
+          totalPoints: 0,
+          booyahCount: 0,
+          lastMatchAt: null,
+          lastMatchIdentifier: null,
+          previousTotalPoints: 0,
+          lastMatchPoints: 0,
+        };
+
+        const matchKillPoints = Number(teamSummary.killPoints) || 0;
+        const matchPlacementPoints = Number(teamSummary.placementPoints) || 0;
+        const matchTotalPoints =
+          Number(teamSummary.totalPoints) ||
+          matchKillPoints + matchPlacementPoints;
+        const previousTotal = existing.totalPoints || 0;
+
+        aggregate[key] = {
+          ...existing,
+          teamId: teamSummary.teamId,
+          teamName: baseName,
+          matches: existing.matches + 1,
+          killPoints: existing.killPoints + matchKillPoints,
+          placementPoints: existing.placementPoints + matchPlacementPoints,
+          totalPoints: previousTotal + matchTotalPoints,
+          booyahCount: existing.booyahCount + (teamSummary.booyah ? 1 : 0),
+          lastMatchAt: timestamp || existing.lastMatchAt,
+          lastMatchIdentifier: matchIdentifier || existing.lastMatchIdentifier,
+          previousTotalPoints: previousTotal,
+          lastMatchPoints: matchTotalPoints,
+        };
+
+        if (teamSummary.booyah) {
+          aggregate[key].lastBooyahAt = timestamp || aggregate[key].lastBooyahAt || null;
+          aggregate[key].lastBooyahMatch = matchIdentifier || aggregate[key].lastBooyahMatch || null;
+        }
+      });
+    });
+
+    return aggregate;
+  };
+
+  const buildGroupExportPayload = (groupKey, overrideData = {}) => {
+    const cleanGroupName = sanitizeGroupName(groupKey);
+    if (!cleanGroupName) return null;
+
+    const currentHistory = Array.isArray(overrideData.matchHistory)
+      ? overrideData.matchHistory
+      : Array.isArray(matchHistory)
+      ? matchHistory
+      : [];
+    const currentScores =
+      overrideData.cumulativeScores && Object.keys(overrideData.cumulativeScores || {}).length > 0
+        ? overrideData.cumulativeScores
+        : Object.keys(cumulativeScores || {}).length > 0
+        ? cumulativeScores
+        : recalculateCumulativeFromHistory(currentHistory);
+
+    const timestamp = new Date().toISOString();
+    const exportRound = sanitizeLabel(overrideData.roundLabel ?? roundLabel, '');
+    const exportMatch = sanitizeLabel(overrideData.matchLabel ?? matchLabel, '');
+
+    return {
+      version: 2,
+      updatedAt: timestamp,
+      groupName: cleanGroupName,
+      roundLabel: exportRound,
+      matchLabel: exportMatch,
+      matchCount: currentHistory.length,
+      cumulativeScores: currentScores,
+      matchHistory: currentHistory,
+    };
+  };
+
+  const triggerBrowserDownload = (data, filenameHint) => {
+    try {
+      const serialized = JSON.stringify(data, null, 2);
+      const blob = new Blob([serialized], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = sanitizeFileName(filenameHint || 'match-summary') + '.json';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      return true;
+    } catch (err) {
+      console.error('Failed to trigger download:', err);
+      return false;
+    }
+  };
+
+  const exportJsonWithPicker = async (data, suggestedBaseName) => {
+    try {
+      const serialized = JSON.stringify(data, null, 2);
+      const blob = new Blob([serialized], { type: 'application/json' });
+      const defaultFileName =
+        sanitizeFileName(suggestedBaseName || 'match-summary') + '.json';
+
+      if (typeof window !== 'undefined' && window.showSaveFilePicker) {
+        try {
+          const fileHandle = await window.showSaveFilePicker({
+            suggestedName: defaultFileName,
+            types: [
+              {
+                description: 'JSON Files',
+                accept: { 'application/json': ['.json'] },
+              },
+            ],
+          });
+
+          const writable = await fileHandle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+
+          return {
+            success: true,
+            fileName: fileHandle.name,
+            message: `Saved as ${fileHandle.name}`,
+          };
+        } catch (err) {
+          if (err && (err.name === 'AbortError' || err.code === 20)) {
+            return {
+              success: false,
+              cancelled: true,
+              message: 'Save cancelled.',
+            };
+          }
+          console.error('showSaveFilePicker failed:', err);
+        }
+      }
+
+      const fallbackSuccess = triggerBrowserDownload(data, suggestedBaseName);
+      return {
+        success: fallbackSuccess,
+        fileName: defaultFileName,
+        message: fallbackSuccess
+          ? 'Download triggered (check your downloads folder).'
+          : 'Download failed.',
+        fallback: true,
+      };
+    } catch (err) {
+      console.error('Failed to export JSON:', err);
+      return {
+        success: false,
+        message: err?.message || 'Failed to export JSON.',
+      };
+    }
+  };
+
+  const handleSaveMatchResults = async () => {
+    const cleanGroupName = sanitizeGroupName(groupName);
+    const cleanRoundLabel = sanitizeLabel(roundLabel, DEFAULT_ROUND_LABEL);
+    const cleanMatchLabel = sanitizeLabel(matchLabel, DEFAULT_MATCH_LABEL);
+
+    if (!cleanGroupName || !cleanRoundLabel || !cleanMatchLabel) {
+      setMatchSaveStatus({
+        type: 'error',
+        message: 'Please enter Group, Round, and Match names before saving.',
+      });
+      return;
+    }
+
+    const matchSummary = buildMatchSummary();
+
+    if (!matchSummary.length) {
+      setMatchSaveStatus({ type: 'error', message: 'No team data available to save yet.' });
+      return;
+    }
+
+    const timestamp = new Date().toISOString();
+    const matchIdentifier = matchId || `match-${timestamp}`;
+    const booyahTeamName = matchSummary.find((team) => team.booyah)?.teamName || null;
+    const suggestedFileNameParts = [
+      sanitizeFileName(cleanGroupName),
+      sanitizeFileName(cleanRoundLabel),
+      sanitizeFileName(cleanMatchLabel),
+    ].filter(Boolean);
+    const suggestedFileBase = suggestedFileNameParts.join('_') || 'match-summary';
+    const matchKey = buildMatchCompositeKey(cleanGroupName, cleanRoundLabel, cleanMatchLabel);
+
+    const newHistoryEntry = {
+      matchId: matchIdentifier,
+      matchKey,
+      clientId,
+      savedAt: timestamp,
+      booyahTeam: booyahTeamName,
+      groupName: cleanGroupName,
+      roundLabel: cleanRoundLabel,
+      matchLabel: cleanMatchLabel,
+      teams: matchSummary.map(({ raw, ...summary }) => summary),
+    };
+
+    const existingIndex = matchHistory.findIndex((entry) => {
+      if (!entry) return false;
+      if (entry.matchKey && entry.matchKey === matchKey) return true;
+      const entryRound = sanitizeLabel(entry.roundLabel, '');
+      const entryMatch = sanitizeLabel(entry.matchLabel, '');
+      return entryRound === cleanRoundLabel && entryMatch === cleanMatchLabel;
+    });
+
+    let updatedHistory;
+    const isUpdate = existingIndex >= 0;
+
+    if (isUpdate) {
+      updatedHistory = matchHistory.map((entry, index) =>
+        index === existingIndex
+          ? { ...entry, ...newHistoryEntry }
+          : entry
+      );
+    } else {
+      updatedHistory = [...matchHistory, newHistoryEntry];
+    }
+
+    // Sort history by savedAt ascending to maintain chronological order
+    updatedHistory = [...updatedHistory].sort((a, b) => {
+      const timeA = new Date(a?.savedAt || 0).getTime();
+      const timeB = new Date(b?.savedAt || 0).getTime();
+      return timeA - timeB;
+    });
+
+    const recalculatedScores = recalculateCumulativeFromHistory(updatedHistory);
+
+    setMatchHistory(updatedHistory);
+    setCumulativeScores(recalculatedScores);
+
+    const baseGroupPayload = {
+      cumulativeScores: recalculatedScores,
+      matchHistory: updatedHistory,
+      lastUpdatedAt: timestamp,
+      lastMatchId: matchIdentifier,
+      lastMatchKey: matchKey,
+      roundLabel: cleanRoundLabel,
+      matchLabel: cleanMatchLabel,
+      lastCompletedMatchLabel: cleanMatchLabel,
+    };
+
+    persistGroupData(cleanGroupName, baseGroupPayload);
+
+    setMatchSaveStatus({
+      type: 'loading',
+      message: `Exporting ${cleanGroupName} • ${cleanRoundLabel} • ${cleanMatchLabel}...`,
+    });
+
+    const exportPayload = buildGroupExportPayload(cleanGroupName, {
+      cumulativeScores: recalculatedScores,
+      matchHistory: updatedHistory,
+      roundLabel: cleanRoundLabel,
+      matchLabel: cleanMatchLabel,
+    });
+
+    if (!exportPayload) {
+      setMatchSaveStatus({
+        type: 'error',
+        message: 'Unable to prepare export payload.',
+      });
+      return;
+    }
+
+    const exportResult = await exportJsonWithPicker(exportPayload, suggestedFileBase);
+
+    if (exportResult.success) {
+      persistGroupData(cleanGroupName, {
+        ...baseGroupPayload,
+        lastExportedFile: exportResult.fileName || `${suggestedFileBase}.json`,
+        lastCompletedMatchLabel: cleanMatchLabel,
+      });
+
+      setMatchSaveStatus({
+        type: 'success',
+        message: `${isUpdate ? 'Updated' : 'Saved'} ${cleanGroupName} • ${cleanRoundLabel} • ${cleanMatchLabel} (${exportResult.fileName || `${suggestedFileBase}.json`}).`,
+      });
+      return;
+    }
+
+    if (exportResult.cancelled) {
+      setMatchSaveStatus({
+        type: 'info',
+        message: `Export cancelled. Standings updated for ${cleanGroupName} • ${cleanRoundLabel} • ${cleanMatchLabel} (browser only).`,
+      });
+      return;
+    }
+
+    setMatchSaveStatus({
+      type: 'error',
+      message:
+        exportResult.message ||
+        `Failed to export ${cleanGroupName} • ${cleanRoundLabel} • ${cleanMatchLabel}.`,
+    });
+  };
+
+  const handleNextMatch = () => {
+    const currentTeams = getFilteredTeams();
+
+    const resetTeams =
+      Array.isArray(currentTeams) && currentTeams.length > 0
+        ? currentTeams.map((team) => {
+            const resetPlayerStats = Array.isArray(team.player_stats)
+              ? team.player_stats.map((player) => {
+                  const totalHp =
+                    (player?.hp_info && Number(player.hp_info.total_hp)) || 200;
+
+                  return {
+                    ...player,
+                    kills: 0,
+                    player_state: 0,
+                    hp_info: {
+                      ...(player?.hp_info || {}),
+                      current_hp: totalHp,
+                      total_hp: totalHp,
+                    },
+                  };
+                })
+              : [];
+
+            return {
+              ...team,
+              kill_count: 0,
+              ranking_score: 0,
+              rank_points: 0,
+              placement_points: 0,
+              position_points: 0,
+              total_points: 0,
+              total_score: 0,
+              points: 0,
+              score: 0,
+              booyah: false,
+              player_stats: resetPlayerStats,
+            };
+          })
+        : [];
+
+    if (resetTeams.length > 0) {
+      setLiveData([{ team_stats: resetTeams }]);
+    } else {
+      setLiveData(null);
+    }
+
+    const cleanGroupName = sanitizeGroupName(groupName);
+    const timestamp = new Date().toISOString();
+    const currentMatchLabel = sanitizeLabel(matchLabel, DEFAULT_MATCH_LABEL);
+    const nextMatchLabel = incrementMatchLabel(currentMatchLabel);
+    const currentRoundLabel = sanitizeLabel(roundLabel, DEFAULT_ROUND_LABEL);
+
+    if (cleanGroupName) {
+      const updatedScores = Object.entries(cumulativeScores || {}).reduce(
+        (acc, [key, value]) => {
+          const totalPoints = value?.totalPoints || 0;
+          acc[key] = {
+            ...value,
+            killPoints: 0,
+            placementPoints: 0,
+            previousTotalPoints: totalPoints,
+            lastMatchPoints: 0,
+          };
+          return acc;
+        },
+        {}
+      );
+
+      setCumulativeScores(updatedScores);
+      persistGroupData(cleanGroupName, {
+        cumulativeScores: updatedScores,
+        matchHistory,
+        lastUpdatedAt: timestamp,
+        roundLabel: currentRoundLabel,
+        matchLabel: nextMatchLabel,
+        lastCompletedMatchLabel: currentMatchLabel,
+      });
+    }
+
+    setMatchId('');
+    setMatchSaveStatus(null);
+    setJsonWriteStatus(null);
+    setError(null);
+    setIsInitialLoad(true);
+    setLoading(false);
+    setRoundLabel(currentRoundLabel);
+    setMatchLabel(nextMatchLabel);
+  };
+ 
+  const handleJsonUpload = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+
+    reader.onload = (uploadEvent) => {
+      try {
+        const fileContent = uploadEvent.target?.result;
+        if (!fileContent || typeof fileContent !== 'string') {
+          throw new Error('Invalid file content');
+        }
+
+        const parsed = JSON.parse(fileContent);
+
+        const importedScores =
+          parsed.cumulativeScores && typeof parsed.cumulativeScores === 'object' && !Array.isArray(parsed.cumulativeScores)
+            ? parsed.cumulativeScores
+            : {};
+
+        const importedHistory = Array.isArray(parsed.matchHistory)
+          ? parsed.matchHistory
+          : Array.isArray(parsed.history)
+          ? parsed.history
+          : [];
+
+        const importedPath =
+          typeof parsed.filePath === 'string'
+            ? parsed.filePath
+            : typeof parsed.exportPath === 'string'
+            ? parsed.exportPath
+            : '';
+
+        const importedGroupName =
+          sanitizeGroupName(
+            parsed.groupName ||
+              parsed.group ||
+              parsed?.metadata?.groupName ||
+              parsed?.metadata?.group ||
+              groupName
+          ) || 'Group A';
+        const importedRoundLabel =
+          sanitizeLabel(
+            parsed.roundLabel ||
+              parsed.round ||
+              parsed?.metadata?.roundLabel ||
+              parsed?.meta?.roundLabel ||
+              roundLabel,
+            DEFAULT_ROUND_LABEL
+          ) || DEFAULT_ROUND_LABEL;
+        const importedMatchLabel =
+          sanitizeLabel(
+            parsed.matchLabel ||
+              parsed.match ||
+              parsed?.metadata?.matchLabel ||
+              parsed?.meta?.matchLabel ||
+              matchLabel,
+            DEFAULT_MATCH_LABEL
+          ) || DEFAULT_MATCH_LABEL;
+        const nextMatchLabel = incrementMatchLabel(importedMatchLabel);
+
+        const normalizedHistory = [...importedHistory].sort((a, b) => {
+          const timeA = new Date(a?.savedAt || 0).getTime();
+          const timeB = new Date(b?.savedAt || 0).getTime();
+          return timeA - timeB;
+        });
+
+        const recalculatedFromImport = recalculateCumulativeFromHistory(normalizedHistory);
+        const resolvedScores =
+          recalculatedFromImport && Object.keys(recalculatedFromImport).length > 0
+            ? recalculatedFromImport
+            : importedScores;
+
+        setCumulativeScores(resolvedScores);
+        setMatchHistory(normalizedHistory);
+        setGroupName(importedGroupName);
+        setRoundLabel(importedRoundLabel);
+        setMatchLabel(nextMatchLabel);
+
+        const importedTimestamp =
+          typeof parsed.updatedAt === 'string'
+            ? parsed.updatedAt
+            : typeof parsed.savedAt === 'string'
+            ? parsed.savedAt
+            : new Date().toISOString();
+
+        persistGroupData(importedGroupName, {
+          cumulativeScores: resolvedScores,
+          matchHistory: normalizedHistory,
+          lastUpdatedAt: importedTimestamp,
+          lastExportedFile: parsed.resolvedFilePath || importedPath || '',
+          roundLabel: importedRoundLabel,
+          matchLabel: nextMatchLabel,
+          lastCompletedMatchLabel: importedMatchLabel,
+        });
+
+        const importedTeamNames = Array.from(
+          new Set(
+            Object.values(resolvedScores || {})
+              .map((entry) => entry?.teamName)
+              .filter((name) => typeof name === 'string' && name.trim().length > 0)
+          )
+        );
+
+        if (importedTeamNames.length > 0) {
+          setTeamNamesInput((prev) => {
+            const existingNames = prev
+              ? prev
+                  .split(/\r?\n/)
+                  .map((name) => name.trim())
+                  .filter((name) => name.length > 0)
+              : [];
+
+            const existingLower = new Set(existingNames.map((name) => name.toLowerCase()));
+
+            const appended = [...existingNames];
+            importedTeamNames.forEach((name) => {
+              if (!existingLower.has(name.toLowerCase())) {
+                appended.push(name);
+                existingLower.add(name.toLowerCase());
+              }
+            });
+
+            return appended.join('\n');
+          });
+        }
+
+        setMatchSaveStatus({
+          type: 'success',
+          message: `Imported standings for ${importedGroupName} from ${file.name}`,
+        });
+      } catch (err) {
+        console.error('Failed to import match summary JSON:', err);
+        setMatchSaveStatus({ type: 'error', message: 'Failed to import JSON file. Please verify the format.' });
+      }
+    };
+
+    reader.readAsText(file);
+
+    // Allow the same file to be selected again later
+    event.target.value = '';
+  };
+
  
   const teams = getFilteredTeams();
   const scoringData = extractScoringData(liveData);
+  const booyahTeam = teams.find((team) => isBooyahTeam(team));
+  const savedGroupNames = Object.keys(groupDataMap || {})
+    .filter((name) => typeof name === 'string' && name.trim().length > 0)
+    .sort((a, b) => a.localeCompare(b));
 
+  const cumulativeScoresList = Object.values(cumulativeScores || {}).map((entry) => ({
+    teamId: entry.teamId ?? null,
+    teamName: entry.teamName || 'Unknown Team',
+    matches: entry.matches || 0,
+    killPoints: entry.killPoints || 0,
+    placementPoints: entry.placementPoints || 0,
+    totalPoints: entry.totalPoints || 0,
+    booyahCount: entry.booyahCount || 0,
+    lastMatchAt: entry.lastMatchAt || null,
+    previousTotalPoints: entry.previousTotalPoints || 0,
+    lastMatchPoints: entry.lastMatchPoints || 0,
+  })).sort((a, b) => b.totalPoints - a.totalPoints);
+
+  const currentMatchKeyLabel = [
+    sanitizeFileName(sanitizeGroupName(groupName) || ''),
+    sanitizeFileName(sanitizeLabel(roundLabel) || ''),
+    sanitizeFileName(sanitizeLabel(matchLabel) || ''),
+  ]
+    .filter(Boolean)
+    .join('_');
+ 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 p-4 md:p-8 relative overflow-hidden">
       {/* Animated background elements */}
@@ -567,6 +1475,230 @@ const LiveScoring = () => {
               </div>
             )}
           </div>
+        </div>
+
+        <div className="bg-gradient-to-br from-slate-800/90 via-slate-800/80 to-slate-900/90 rounded-2xl p-6 md:p-8 mb-8 shadow-2xl border border-slate-700/50 backdrop-blur-sm">
+          <h3 className="text-xl font-black text-transparent bg-clip-text bg-gradient-to-r from-yellow-300 via-orange-400 to-red-400 mb-4">
+            📦 Match Summary Storage
+          </h3>
+          <p className="text-slate-400 text-sm mb-6">
+            When a team secures BOOYAH, capture the current standings to keep cumulative points across matches. Standings live in this session only—every save lets you choose where to export the JSON snapshot.
+          </p>
+
+          <div className="mb-6">
+            <label className="block text-slate-200 text-sm font-semibold mb-3">
+              Active Group Name
+            </label>
+            <input
+              type="text"
+              value={groupName}
+              onChange={(e) => handleActiveGroupChange(e.target.value)}
+              placeholder="e.g. GroupA"
+              className="w-full px-5 py-3 bg-slate-900/80 text-white rounded-xl border-2 border-slate-700 focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:border-yellow-500 transition-all shadow-lg font-mono text-sm"
+            />
+            <p className="text-slate-400 text-xs mt-2">
+              Standings, history, and exports are stored separately for each group. Switch groups by typing an existing name or creating a new one.
+            </p>
+
+            {currentMatchKeyLabel && (
+              <p className="text-slate-500 text-xs font-mono mt-2">
+                Current Key: {currentMatchKeyLabel}
+              </p>
+            )}
+
+            {savedGroupNames.length > 1 && (
+              <div className="flex flex-wrap gap-2 mt-3">
+                {savedGroupNames.map((savedName) => (
+                  <button
+                    key={savedName}
+                    type="button"
+                    onClick={() => handleActiveGroupChange(savedName)}
+                    className={`px-3 py-1.5 rounded-full text-xs font-semibold transition-all border ${
+                      savedName === groupName
+                        ? 'bg-yellow-500/90 border-yellow-400 text-slate-900'
+                        : 'bg-slate-800/70 border-slate-600 text-slate-300 hover:bg-slate-700/70'
+                    }`}
+                  >
+                    {savedName}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-5 mb-6">
+            <div>
+              <label className="block text-slate-200 text-sm font-semibold mb-3">
+                Round Label
+              </label>
+              <input
+                type="text"
+                value={roundLabel}
+                onChange={(e) => {
+                  const nextValue = e.target.value;
+                  setRoundLabel(nextValue);
+                  const cleanGroup = sanitizeGroupName(groupName);
+                  if (cleanGroup) {
+                    persistGroupData(cleanGroup, {
+                      cumulativeScores,
+                      matchHistory,
+                      roundLabel: sanitizeLabel(nextValue, DEFAULT_ROUND_LABEL),
+                      matchLabel: sanitizeLabel(matchLabel, DEFAULT_MATCH_LABEL),
+                    });
+                  }
+                }}
+                placeholder="e.g. R1"
+                className="w-full px-5 py-3 bg-slate-900/80 text-white rounded-xl border-2 border-slate-700 focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:border-yellow-500 transition-all shadow-lg font-mono text-sm"
+              />
+              <p className="text-slate-400 text-xs mt-2">
+                Use this to track which round these standings belong to.
+              </p>
+            </div>
+            <div>
+              <label className="block text-slate-200 text-sm font-semibold mb-3">
+                Match Label
+              </label>
+              <input
+                type="text"
+                value={matchLabel}
+                onChange={(e) => {
+                  const nextValue = e.target.value;
+                  setMatchLabel(nextValue);
+                  const cleanGroup = sanitizeGroupName(groupName);
+                  if (cleanGroup) {
+                    persistGroupData(cleanGroup, {
+                      cumulativeScores,
+                      matchHistory,
+                      roundLabel: sanitizeLabel(roundLabel, DEFAULT_ROUND_LABEL),
+                      matchLabel: sanitizeLabel(nextValue, DEFAULT_MATCH_LABEL),
+                    });
+                  }
+                }}
+                placeholder="e.g. M1"
+                className="w-full px-5 py-3 bg-slate-900/80 text-white rounded-xl border-2 border-slate-700 focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:border-yellow-500 transition-all shadow-lg font-mono text-sm"
+              />
+              <p className="text-slate-400 text-xs mt-2">
+                Specify the match number or name (e.g. Match 2, Finals Match 1).
+              </p>
+            </div>
+          </div>
+
+          <div className="mb-6">
+            <label className="block text-slate-200 text-sm font-semibold mb-3">
+              Import Saved Summary JSON
+            </label>
+            <label
+              htmlFor="match-summary-upload"
+              className="inline-flex items-center gap-2 px-5 py-3 bg-gradient-to-r from-slate-700 via-slate-600 to-slate-700 hover:from-slate-600 hover:via-slate-500 hover:to-slate-600 text-white font-semibold rounded-xl cursor-pointer transition-all shadow-lg"
+            >
+              ⬆️ Upload JSON
+            </label>
+            <input
+              id="match-summary-upload"
+              type="file"
+              accept="application/json,.json"
+              onChange={handleJsonUpload}
+              className="hidden"
+            />
+            <p className="text-slate-400 text-xs mt-2">
+              Import a previously exported summary to continue adding results in later matches.
+            </p>
+          </div>
+
+          <div className="flex flex-col md:flex-row md:items-center gap-3 md:gap-4">
+            <button
+              onClick={handleSaveMatchResults}
+              disabled={
+                !booyahTeam ||
+                !teams.length ||
+                !sanitizeGroupName(groupName) ||
+                !sanitizeLabel(roundLabel) ||
+                !sanitizeLabel(matchLabel)
+              }
+              className="w-full md:w-auto px-6 py-2.5 bg-gradient-to-r from-yellow-500 via-orange-500 to-red-500 hover:from-yellow-400 hover:via-orange-400 hover:to-red-400 text-black font-bold rounded-xl transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-xl hover:shadow-2xl hover:shadow-orange-500/50 transform hover:scale-105 active:scale-95"
+            >
+              {booyahTeam
+                ? `💾 Save ${sanitizeGroupName(groupName) || 'Group'} • ${sanitizeLabel(roundLabel) || 'Round'} • ${sanitizeLabel(matchLabel) || 'Match'}`
+                : 'Waiting for BOOYAH...'}
+            </button>
+
+            <button
+              type="button"
+              onClick={handleNextMatch}
+              className="w-full md:w-auto px-6 py-2.5 bg-gradient-to-r from-slate-700 via-slate-600 to-slate-700 hover:from-slate-600 hover:via-slate-500 hover:to-slate-600 text-white font-bold rounded-xl transition-all shadow-lg hover:shadow-2xl hover:shadow-slate-500/40 transform hover:scale-105 active:scale-95"
+            >
+              ➡️ Next Match
+            </button>
+          </div>
+
+          {(!sanitizeGroupName(groupName) || !sanitizeLabel(roundLabel) || !sanitizeLabel(matchLabel)) && (
+            <p className="text-xs text-red-300 mt-3">
+              Enter group, round, and match names to enable saving and exporting standings.
+            </p>
+          )}
+
+          {matchSaveStatus && (
+            <div
+              className={`px-4 py-3 rounded-xl mt-4 ${
+                matchSaveStatus.type === 'success'
+                  ? 'bg-green-900/50 border-2 border-green-700 text-green-100'
+                  : matchSaveStatus.type === 'error'
+                  ? 'bg-red-900/50 border-2 border-red-700 text-red-100'
+                  : matchSaveStatus.type === 'loading'
+                  ? 'bg-blue-900/50 border-2 border-blue-700 text-blue-100'
+                  : 'bg-slate-900/60 border-2 border-slate-700 text-slate-200'
+              }`}
+            >
+              <p className="text-sm font-semibold">
+                {matchSaveStatus.type === 'success' && '✅ '}
+                {matchSaveStatus.type === 'error' && '❌ '}
+                {matchSaveStatus.type === 'loading' && '⏳ '}
+                {matchSaveStatus.type === 'info' && 'ℹ️ '}
+                {matchSaveStatus.message}
+              </p>
+            </div>
+          )}
+
+          {cumulativeScoresList.length > 0 && (
+            <div className="mt-6">
+              <p className="text-slate-300 text-sm font-semibold mb-3">
+                Cumulative Standings — {sanitizeGroupName(groupName) || 'No group selected'}
+              </p>
+              <div className="overflow-x-auto bg-slate-900/70 border border-slate-700 rounded-xl">
+                <table className="min-w-full text-sm text-left text-slate-300">
+                  <thead className="text-xs uppercase tracking-wider text-slate-400 bg-slate-900/90">
+                    <tr>
+                      <th className="px-4 py-3">Pos</th>
+                      <th className="px-4 py-3">Team</th>
+                      <th className="px-4 py-3">Matches</th>
+                      <th className="px-4 py-3">Booyah</th>
+                      <th className="px-4 py-3">Kills</th>
+                      <th className="px-4 py-3">Placement</th>
+                      <th className="px-4 py-3">Prev Total</th>
+                      <th className="px-4 py-3">Total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {cumulativeScoresList.map((entry, index) => (
+                      <tr
+                        key={`${entry.teamName}-${index}`}
+                        className={`border-t border-slate-800/70 ${index % 2 === 0 ? 'bg-slate-900/50' : 'bg-slate-900/40'}`}
+                      >
+                        <td className="px-4 py-3 font-bold text-slate-100">#{index + 1}</td>
+                        <td className="px-4 py-3 font-semibold text-slate-100">{entry.teamName}</td>
+                        <td className="px-4 py-3">{entry.matches}</td>
+                        <td className="px-4 py-3">{entry.booyahCount}</td>
+                        <td className="px-4 py-3 text-red-300">{entry.killPoints}</td>
+                        <td className="px-4 py-3 text-yellow-300">{entry.placementPoints}</td>
+                        <td className="px-4 py-3 text-slate-300">{entry.previousTotalPoints}</td>
+                        <td className="px-4 py-3 text-green-300 font-bold">{entry.totalPoints}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Team Names Input Section - NEW */}

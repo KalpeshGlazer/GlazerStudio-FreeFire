@@ -7,9 +7,9 @@ import useAuthStore from '@/store/useAuthStore';
 export default function Home() {
   const { authFlag, logout, email } = useAuthStore();
 
-  if (authFlag !== 1) {
-    return <Login />;
-  }
+  // if (authFlag !== 1) {
+  //   return <Login />;
+  // }
 
   return (
     <div className="relative min-h-screen">
