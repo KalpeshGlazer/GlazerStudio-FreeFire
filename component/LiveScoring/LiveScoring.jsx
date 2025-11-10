@@ -76,6 +76,7 @@ const LiveScoring = () => {
   }));
   const [roundLabel, setRoundLabel] = useState(DEFAULT_ROUND_LABEL);
   const [matchLabel, setMatchLabel] = useState(DEFAULT_MATCH_LABEL);
+  const [manualTeamSlots, setManualTeamSlots] = useState({});
 
   const persistGroupData = useCallback(
     (groupKey, payload) => {
@@ -358,110 +359,121 @@ const LiveScoring = () => {
     const zoneIn = zoneInImage.trim();
     const zoneOut = zoneOutImage.trim();
 
-    // Generate Team names (Team1, Team2, Team3) - capital T
-    sortedTeams.forEach((team, index) => {
-      const teamName = team.team_name || `Team ${index + 1}`;
+    const totalSlots = Math.max(sortedTeams.length, 12);
+    const baseLogoPath = logoFolderPath.trim() ? logoFolderPath.replace(/[\\/]+$/, '') : '';
+    const logoSeparator = baseLogoPath.includes('\\') ? '\\' : '/';
+    const baseHpPath = hpFolderPath && hpFolderPath.trim() ? hpFolderPath.replace(/[\\/]+$/, '') : '';
+    const hpSeparator = baseHpPath.includes('\\') ? '\\' : '/';
+
+    const slots = Array.from({ length: totalSlots }, (_, index) => {
       const position = index + 1;
+      const team = sortedTeams[index] || null;
+      const manualName = manualTeamSlots[position] || '';
+      const teamName = team ? team.team_name || `Team ${position}` : manualName;
+      const hasTeamData = Boolean(team);
+
+      let logoPath = '';
+      if (baseLogoPath) {
+        const normalizedTeamName = teamName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+        const logoFileName = normalizedTeamName ? `${normalizedTeamName}.png` : 'default.png';
+        logoPath = `${baseLogoPath}${logoSeparator}${logoFileName}`;
+      }
+
+      const finValue = hasTeamData ? team.totalKills || 0 : 0;
+      const totalPointsValue =
+        hasTeamData && Number.isFinite(team.combinedTotalPoints)
+          ? Math.round(team.combinedTotalPoints)
+          : 0;
+
+      let zoneValue = zoneIn || '';
+      if (hasTeamData) {
+        const relevantPlayers = (team.player_stats || []).filter(
+          (player) => player?.player_state !== 1
+        );
+        const anyPlayerOutside = relevantPlayers.some((player) => player.is_in_safe_zone === false);
+        zoneValue = anyPlayerOutside ? zoneOut || zoneIn || '' : zoneIn || '';
+      }
+
+      let winRateValue = '0%';
+      if (hasTeamData) {
+        const winRate = team.win_rate ?? 0;
+        const winRateNumeric = typeof winRate === 'number' ? winRate : parseFloat(winRate) || 0;
+        const normalizedWinRate = Number.isFinite(winRateNumeric) ? winRateNumeric : 0;
+        winRateValue = `${normalizedWinRate}%`;
+      }
+
+      const hpPaths = Array.from({ length: 4 }, (_, playerIndex) => {
+        const player =
+          hasTeamData && Array.isArray(team.player_stats) ? team.player_stats[playerIndex] : null;
+
+        if (player && baseHpPath) {
+          const playerHP = getPlayerHP(player);
+          let hpValue = playerHP;
+          if (player.player_state === 2) {
+            hpValue = -playerHP;
+          }
+          const hpImagePath = `${baseHpPath}${hpSeparator}${hpValue}.png`;
+          console.log(
+            `Set T${position}P${playerIndex + 1} to:`,
+            hpImagePath,
+            ` (player_state: ${player.player_state})`
+          );
+          return hpImagePath;
+        }
+
+        if (baseHpPath) {
+          return `${baseHpPath}${hpSeparator}0.png`;
+        }
+
+        return '';
+      });
+
+      return {
+        position,
+        teamName,
+        rank: `#${position}`,
+        logoPath,
+        finValue,
+        totalPointsValue,
+        zoneValue,
+        winRateValue,
+        hpPaths,
+      };
+    });
+
+    // Maintain JSON key order: Teams, Ranks, Logos, FIN, TOTAL, ZONE, WINRATE, HP entries
+    slots.forEach(({ position, teamName }) => {
       jsonData[`Team${position}`] = teamName;
     });
 
-    // Generate Rank fields (RANK1, RANK2, ...)
-    sortedTeams.forEach((_, index) => {
-      const position = index + 1;
-      jsonData[`RANK${position}`] = position;
+    slots.forEach(({ position, rank }) => {
+      jsonData[`RANK${position}`] = rank;
     });
 
-    // Generate Logo paths (Logo1, Logo2, Logo3) - capital L
-    sortedTeams.forEach((team, index) => {
-      const teamName = team.team_name || `Team ${index + 1}`;
-      const position = index + 1;
-
-      if (logoFolderPath.trim()) {
-        // Normalize team name for file path (remove spaces, special chars)
-        const normalizedTeamName = teamName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-        const basePath = logoFolderPath.replace(/[\\/]+$/, '');
-        const separator = basePath.includes('\\') ? '\\' : '/';
-        const logoPath = `${basePath}${separator}${normalizedTeamName}.png`;
-        jsonData[`Logo${position}`] = logoPath;
-      } else {
-        jsonData[`Logo${position}`] = '';
-      }
+    slots.forEach(({ position, logoPath }) => {
+      jsonData[`Logo${position}`] = logoPath;
     });
 
-    // Generate FINISHES (FIN1, FIN2, FIN3) - based on total kill points
-    sortedTeams.forEach((team, index) => {
-      const position = index + 1;
-      jsonData[`FIN${position}`] = team.totalKills || 0;
+    slots.forEach(({ position, finValue }) => {
+      jsonData[`FIN${position}`] = finValue;
     });
 
-    // Generate Total points (Total1, Total2, Total3) - previous + current match
-    sortedTeams.forEach((team, index) => {
-      const position = index + 1;
-      const totalPointsValue = Number.isFinite(team.combinedTotalPoints)
-        ? Math.round(team.combinedTotalPoints)
-        : 0;
+    slots.forEach(({ position, totalPointsValue }) => {
       jsonData[`TOTAL${position}`] = totalPointsValue;
     });
 
-    // Generate Zone image paths (ZONE1, ZONE2, ...) - positioned before win rates
-    sortedTeams.forEach((team, index) => {
-      const relevantPlayers = (team.player_stats || []).filter((player) => player?.player_state !== 1);
-      const anyPlayerOutside = relevantPlayers.some((player) => player.is_in_safe_zone === false);
-      jsonData[`ZONE${index + 1}`] = anyPlayerOutside ? zoneOut || '' : zoneIn || '';
+    slots.forEach(({ position, zoneValue }) => {
+      jsonData[`ZONE${position}`] = zoneValue;
     });
 
-    // Generate Win Rates (WinRate1, WinRate2, ...)
-    sortedTeams.forEach((team, index) => {
-      const position = index + 1;
-      const winRate = team.win_rate ?? 0;
-      const winRateNumeric = typeof winRate === 'number' ? winRate : parseFloat(winRate) || 0;
-      const winRateValue = Number.isFinite(winRateNumeric) ? winRateNumeric : 0;
-      jsonData[`WINRATE${position}`] = `${winRateValue}%`;
+    slots.forEach(({ position, winRateValue }) => {
+      jsonData[`WINRATE${position}`] = winRateValue;
     });
 
-    // Generate HP IMAGE PATHS for each team (only include existing players)
-    // Team 1 players: T1P1, T1P2, T1P3, T1P4 (HP image path) - only if players exist
-    // Team 2 players: T2P1, T2P2, T2P3, T2P4
-    // For solo tournaments: only T1P1 will be shown if there's only 1 player
-    sortedTeams.forEach((team, teamIndex) => {
-      const teamNumber = teamIndex + 1;
-      const players = team.player_stats || [];
-      
-      console.log(`Team ${teamNumber} has ${players.length} players, hpFolderPath:`, hpFolderPath);
-      
-      // Only include players that actually exist (no empty slots)
-      if (players.length > 0) {
-        players.slice(0, 4).forEach((player, playerIndex) => {
-          const playerNumber = playerIndex + 1;
-          const playerHP = getPlayerHP(player);
-          
-          console.log(`Player ${playerNumber} HP:`, playerHP, 'Player data:', player);
-          
-          // HP image path directly in T1P1, T1P2, etc.
-          if (hpFolderPath && hpFolderPath.trim()) {
-            // Check if player is knocked down (player_state = 2)
-            // If knocked down, use negative HP value (e.g., -70.png instead of 70.png)
-            let hpValue = playerHP;
-            if (player.player_state === 2) {
-              hpValue = -playerHP; // Make it negative for knockdown
-            }
-
-            const basePath = hpFolderPath.replace(/[\\/]+$/, '');
-            const separator = basePath.includes('\\') ? '\\' : '/';
-            const hpImagePath = `${basePath}${separator}${hpValue}.png`;
-            jsonData[`T${teamNumber}P${playerNumber}`] = hpImagePath;
-            console.log(`Set T${teamNumber}P${playerNumber} to:`, hpImagePath, `(player_state: ${player.player_state})`);
-          } else {
-            jsonData[`T${teamNumber}P${playerNumber}`] = '';
-            console.log(`HP folder path not set, T${teamNumber}P${playerNumber} is empty`);
-          }
-        });
-      } else {
-        console.log(`Team ${teamNumber} has no players`);
-      }
-      
-      // Removed: No longer filling empty slots with 0.png
-      // This way, solo tournaments will only show T1P1, not T1P2, T1P3, T1P4
+    slots.forEach(({ position, hpPaths }) => {
+      hpPaths.forEach((hpPath, playerIndex) => {
+        jsonData[`T${position}P${playerIndex + 1}`] = hpPath;
+      });
     });
 
     // Return as array with single object
@@ -681,6 +693,18 @@ const LiveScoring = () => {
       return {
         ...prev,
         [key]: value,
+      };
+    });
+  };
+
+  const handleManualTeamSlotChange = (position, value) => {
+    setManualTeamSlots((prev) => {
+      if (prev[position] === value) {
+        return prev;
+      }
+      return {
+        ...prev,
+        [position]: value,
       };
     });
   };
@@ -1779,9 +1803,9 @@ const LiveScoring = () => {
               Left column shows the team names fetched from the match. Enter your preferred display name on the right.
             </p>
           </div>
-          {Array.isArray(sourceTeams) && sourceTeams.length > 0 ? (
-            <div className="space-y-3">
-              {sourceTeams.map((team, index) => {
+          <div className="space-y-3">
+            {Array.isArray(sourceTeams) && sourceTeams.length > 0 ? (
+              sourceTeams.map((team, index) => {
                 const baseName = resolveTeamBaseName(team, index);
                 const key = normalizeTeamNameKey(baseName);
                 const overrideValue =
@@ -1807,14 +1831,44 @@ const LiveScoring = () => {
                     />
                   </div>
                 );
-              })}
-            </div>
-          ) : (
-            <p className="text-slate-400 text-sm">
-              Fetch match data to automatically load participating teams. You can then add or adjust
-              display names here.
-            </p>
-          )}
+              })
+            ) : (
+              <p className="text-slate-400 text-sm">
+                Fetch match data to automatically load participating teams. You can then add or adjust
+                display names here.
+              </p>
+            )}
+
+            {(() => {
+              const existingCount = Array.isArray(sourceTeams) ? sourceTeams.length : 0;
+              const manualSlotCount = Math.max(0, 12 - existingCount);
+
+              return Array.from({ length: manualSlotCount }, (_, i) => {
+                const position = existingCount + i + 1;
+                const currentValue = manualTeamSlots[position] || '';
+                return (
+                  <div
+                    key={`manual-slot-${position}`}
+                    className="grid grid-cols-1 md:grid-cols-2 gap-3 items-center"
+                  >
+                    <div className="px-4 py-3 bg-slate-900/70 border-2 border-slate-700 rounded-xl text-slate-200 font-semibold flex items-center justify-between">
+                      <span className="truncate">Team Slot {position}</span>
+                      <span className="text-[10px] uppercase tracking-widest text-slate-500 ml-3">
+                        Manual
+                      </span>
+                    </div>
+                    <input
+                      type="text"
+                      value={currentValue}
+                      onChange={(e) => handleManualTeamSlotChange(position, e.target.value)}
+                      placeholder={`Team ${position} name (optional)`}
+                      className="w-full px-5 py-3 bg-slate-900/80 text-white rounded-xl border-2 border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all shadow-lg font-semibold"
+                    />
+                  </div>
+                );
+              });
+            })()}
+          </div>
         </div>
 
         {/* Input Section */}
