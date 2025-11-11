@@ -72,6 +72,11 @@ const normalizeTeamNameKey = (name) => {
   if (typeof name !== 'string') return '';
   return name.trim().toLowerCase();
 };
+
+const normalizeGroupKey = (name) => {
+  if (typeof name !== 'string') return '';
+  return name.replace(/\s+/g, '').trim().toLowerCase();
+};
 const resolveTeamBaseName = (team, index = 0) => {
   const preferredCandidates = [
     team?.original_team_name,
@@ -113,6 +118,7 @@ const resolveTeamBaseName = (team, index = 0) => {
   return `Team ${index + 1}`;
 };
 const ROUND_ROBIN_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const UNASSIGNED_GROUP_KEY = '__unassigned__';
 
 const createDefaultRoundRobinConfig = (groupCount = 3, teamsPerGroup = 2) => {
   const sanitizedGroupCount = Math.max(1, Math.min(Number(groupCount) || 1, ROUND_ROBIN_ALPHABET.length));
@@ -184,6 +190,8 @@ const LiveScoring = () => {
   const [teamNameSuggestions, setTeamNameSuggestions] = useState([]);
   const [jsonFilePath, setJsonFilePath] = useState(''); // File path state
   const [jsonWriteStatus, setJsonWriteStatus] = useState(null); // Status for JSON writing
+  const [jsonGroupingMode, setJsonGroupingMode] = useState('overall');
+  const [jsonGroupOrder, setJsonGroupOrder] = useState([]);
   const [logoFolderPath, setLogoFolderPath] = useState('D:\\Production Assets\\team logos'); // Logo folder path
   const [hpFolderPath, setHpFolderPath] = useState('D:\\Production Assets\\Alive health pins'); // NEW: HP images folder path
   const [zoneInImage, setZoneInImage] = useState('D:\\Production Assets\\INZONE\\100001.png');
@@ -231,6 +239,112 @@ const LiveScoring = () => {
 
     return options;
   }, [roundRobinConfig]);
+
+  const activeRoundRobinGroups = useMemo(() => {
+    if (!roundRobinConfig || !Array.isArray(roundRobinConfig.groups)) {
+      return [];
+    }
+
+    return roundRobinConfig.groups
+      .map((group, index) => {
+        if (!group || group.enabled === false) {
+          return null;
+        }
+
+        const label =
+          typeof group.name === 'string' && group.name.trim().length > 0
+            ? sanitizeGroupName(group.name)
+            : `Group ${ROUND_ROBIN_ALPHABET[index] || index + 1}`;
+
+        const key = normalizeGroupKey(label);
+
+        return {
+          key,
+          label,
+          index,
+          teams: Array.isArray(group.teams) ? group.teams : [],
+        };
+      })
+      .filter(Boolean);
+  }, [roundRobinConfig]);
+
+  const roundRobinGroupMap = useMemo(() => {
+    const map = new Map();
+
+    activeRoundRobinGroups.forEach((group) => {
+      group.teams.forEach((teamName) => {
+        if (typeof teamName !== 'string' || !teamName.trim()) return;
+        const teamKey = normalizeTeamNameKey(teamName);
+        if (!teamKey) return;
+        map.set(teamKey, {
+          label: group.label,
+          key: group.key,
+        });
+      });
+    });
+
+    return map;
+  }, [activeRoundRobinGroups]);
+
+  const resolveGroupByCandidates = useCallback(
+    (candidates = []) => {
+      if (!Array.isArray(candidates) || candidates.length === 0) {
+        return null;
+      }
+
+      for (const candidate of candidates) {
+        if (!candidate) continue;
+        const normalized = normalizeTeamNameKey(candidate);
+        if (normalized && roundRobinGroupMap.has(normalized)) {
+          return roundRobinGroupMap.get(normalized);
+        }
+      }
+
+      return null;
+    },
+    [roundRobinGroupMap]
+  );
+
+  useEffect(() => {
+    if (tournamentFormat !== 'roundRobin' && jsonGroupingMode !== 'overall') {
+      setJsonGroupingMode('overall');
+    }
+  }, [tournamentFormat, jsonGroupingMode]);
+
+  useEffect(() => {
+    if (jsonGroupingMode !== 'group') {
+      return;
+    }
+
+    const validKeys = new Set(activeRoundRobinGroups.map((group) => group.key));
+    const nextOrder = jsonGroupOrder.filter((key) => validKeys.has(key));
+
+    if (nextOrder.length !== jsonGroupOrder.length) {
+      setJsonGroupOrder(nextOrder);
+    }
+  }, [jsonGroupingMode, jsonGroupOrder, activeRoundRobinGroups]);
+
+  const handleJsonGroupingModeChange = useCallback((nextMode) => {
+    setJsonGroupingMode(nextMode === 'group' ? 'group' : 'overall');
+  }, []);
+
+  const handleAddGroupToOrder = useCallback((groupKey) => {
+    if (!groupKey) return;
+    setJsonGroupOrder((prev) => {
+      if (prev.includes(groupKey)) {
+        return prev;
+      }
+      return [...prev, groupKey];
+    });
+  }, []);
+
+  const handleRemoveGroupFromOrder = useCallback((groupKey) => {
+    setJsonGroupOrder((prev) => prev.filter((key) => key !== groupKey));
+  }, []);
+
+  const handleResetGroupOrder = useCallback(() => {
+    setJsonGroupOrder([]);
+  }, []);
 
   const persistGroupData = useCallback(
     (groupKey, payload) => {
@@ -671,52 +785,79 @@ const LiveScoring = () => {
 
     const scoreEntries = cumulativeScores && typeof cumulativeScores === 'object' ? cumulativeScores : {};
 
-    const findCumulativeEntryForTeam = (team) => {
-      if (!team) return null;
+    const buildTeamCandidateNames = (team) => {
+      const candidates = [];
 
-      const attempts = [];
-      const name = typeof team.team_name === 'string' ? team.team_name.trim() : '';
-      if (name) {
-        attempts.push(name, name.toLowerCase());
+      const addCandidate = (value) => {
+        if (value === null || value === undefined) return;
+        const stringValue =
+          typeof value === 'string' ? value.trim() : String(value).trim();
+        if (!stringValue) return;
+        candidates.push(stringValue);
+      };
+
+      if (!team || typeof team !== 'object') {
+        return candidates;
       }
 
-      const originalName =
-        typeof team.original_team_name === 'string' ? team.original_team_name.trim() : '';
-      if (originalName && originalName !== name) {
-        attempts.push(originalName, originalName.toLowerCase());
-      }
+      addCandidate(team.team_name);
+      addCandidate(team.teamName);
+      addCandidate(team.name);
+      addCandidate(team.display_name);
+      addCandidate(team.displayName);
+      addCandidate(team.original_team_name);
+      addCandidate(team.originalTeamName);
+      addCandidate(team?.raw?.team_name);
+      addCandidate(team?.raw?.teamName);
+      addCandidate(team?.raw?.original_team_name);
 
       const teamId = team.team_id ?? team.assigned_id ?? team.id;
       if (teamId !== null && teamId !== undefined) {
         const idString = String(teamId).trim();
-        if (idString) {
-          attempts.push(idString, `team-${idString}`, `Team ${idString}`);
-        }
+        addCandidate(idString);
+        addCandidate(`Team ${idString}`);
+        addCandidate(`team-${idString}`);
       }
 
+      return Array.from(new Set(candidates));
+    };
+
+    const findCumulativeEntryForTeam = (team) => {
+      if (!team) return null;
+
+      const attempts = buildTeamCandidateNames(team);
+      if (!attempts.length) return null;
+
       for (const key of attempts) {
-        if (!key) continue;
         if (scoreEntries[key]) {
           return scoreEntries[key];
         }
       }
 
-      if (name) {
-        const normalized = name.toLowerCase();
-        const matched = Object.entries(scoreEntries).find(([key, value]) => {
-          const candidates = [];
-          if (typeof key === 'string') {
-            candidates.push(key.trim().toLowerCase());
-          }
-          if (value && typeof value.teamName === 'string') {
-            candidates.push(value.teamName.trim().toLowerCase());
-          }
-          return candidates.some((candidate) => candidate === normalized);
-        });
-
-        if (matched) {
-          return matched[1];
+      for (const key of attempts) {
+        const normalizedKey = key.trim().toLowerCase();
+        if (normalizedKey && scoreEntries[normalizedKey]) {
+          return scoreEntries[normalizedKey];
         }
+      }
+
+      const normalizedAttempts = attempts
+        .map((attempt) => attempt.trim().toLowerCase())
+        .filter(Boolean);
+
+      const matched = Object.entries(scoreEntries).find(([key, value]) => {
+        const candidates = [];
+        if (typeof key === 'string') {
+          candidates.push(key.trim().toLowerCase());
+        }
+        if (value && typeof value.teamName === 'string') {
+          candidates.push(value.teamName.trim().toLowerCase());
+        }
+        return candidates.some((candidate) => normalizedAttempts.includes(candidate));
+      });
+
+      if (matched) {
+        return matched[1];
       }
 
       return null;
@@ -746,6 +887,8 @@ const LiveScoring = () => {
       const previousTotal = resolvePreviousTotalPoints(cumulativeEntry);
       const safeCurrentTotal = Number.isFinite(currentMatchTotal) ? currentMatchTotal : 0;
       const combinedTotal = previousTotal + safeCurrentTotal;
+      const candidateNames = buildTeamCandidateNames(team);
+      const groupInfo = resolveGroupByCandidates(candidateNames);
 
       return {
         ...team,
@@ -755,21 +898,251 @@ const LiveScoring = () => {
         currentMatchTotalPoints: safeCurrentTotal,
         previousTotalPoints: previousTotal,
         combinedTotalPoints: Number.isFinite(combinedTotal) ? combinedTotal : 0,
+        groupName: groupInfo?.label || null,
+        groupKey: groupInfo?.key || null,
+        nameCandidates: candidateNames,
       };
     });
 
     // Sort teams by combined total points (previous cumulative + current match), break ties by kills
-    const sortedTeams = [...teamsWithStats].sort((a, b) => {
+    const combinedRankedTeams = [...teamsWithStats].sort((a, b) => {
       const diff = (b.combinedTotalPoints || 0) - (a.combinedTotalPoints || 0);
       if (diff !== 0) return diff;
       return (b.totalKills || 0) - (a.totalKills || 0);
     });
 
+    combinedRankedTeams.forEach((team, index) => {
+      team.overallRank = index + 1;
+    });
+
+    let roundRobinRankLookup = null;
+
+    if (tournamentFormat === 'roundRobin') {
+      const standingsMap = new Map();
+      const enabledGroupKeys = new Set(activeRoundRobinGroups.map((group) => group.key));
+
+      const addStandingEntry = (name, data = {}) => {
+        if (typeof name !== 'string') return;
+        const key = normalizeTeamNameKey(name);
+        if (!key) return;
+
+        const existing = standingsMap.get(key) || {};
+
+        const numericCombined =
+          Number(data.combinedTotalPoints ?? data.totalPoints ?? data.points ?? 0);
+        const numericKills = Number(data.killPoints ?? data.totalKills ?? 0);
+
+        const previousCombined = Number(existing.combinedTotalPoints ?? 0);
+        const previousKills = Number(existing.killPoints ?? 0);
+
+        standingsMap.set(key, {
+          key,
+          teamName: data.teamName || name || existing.teamName || name,
+          combinedTotalPoints: Number.isFinite(numericCombined)
+            ? Math.max(numericCombined, previousCombined)
+            : previousCombined,
+          killPoints: Number.isFinite(numericKills)
+            ? Math.max(numericKills, previousKills)
+            : previousKills,
+        });
+      };
+
+      const addCumulativeScores = (scores) => {
+        if (!scores || typeof scores !== 'object') return;
+        Object.values(scores).forEach((entry) => {
+          if (!entry || typeof entry !== 'object') return;
+          const nameCandidate =
+            typeof entry.teamName === 'string'
+              ? entry.teamName
+              : entry.teamId !== undefined && entry.teamId !== null
+              ? `Team ${entry.teamId}`
+              : null;
+          if (!nameCandidate) return;
+
+          addStandingEntry(nameCandidate, {
+            teamName: entry.teamName || nameCandidate,
+            combinedTotalPoints: Number(entry.totalPoints) || 0,
+            killPoints: Number(entry.killPoints) || 0,
+          });
+        });
+      };
+
+      Object.entries(groupDataMap || {}).forEach(([groupKey, groupEntry]) => {
+        if (!groupEntry || typeof groupEntry !== 'object') return;
+        const compactKey = normalizeGroupKey(groupKey);
+        if (enabledGroupKeys.size > 0 && !enabledGroupKeys.has(compactKey)) {
+          return;
+        }
+        addCumulativeScores(groupEntry.cumulativeScores);
+      });
+
+      addCumulativeScores(cumulativeScores);
+
+      teamsWithStats.forEach((team) => {
+        if (team.manualPlaceholder) {
+          return;
+        }
+        const candidateNames = Array.isArray(team.nameCandidates) ? team.nameCandidates : [];
+
+        let matched = false;
+
+        candidateNames.forEach((candidate) => {
+          if (!candidate || matched) return;
+          const key = normalizeTeamNameKey(candidate);
+          if (key && standingsMap.has(key)) {
+            const existing = standingsMap.get(key);
+            standingsMap.set(key, {
+              ...existing,
+              teamName: team.team_name || existing.teamName || candidate,
+              combinedTotalPoints: Math.max(
+                Number(team.combinedTotalPoints) || 0,
+                Number(existing.combinedTotalPoints) || 0
+              ),
+              killPoints: Math.max(
+                Number(team.killPoints) || Number(team.totalKills) || 0,
+                Number(existing.killPoints) || 0
+              ),
+            });
+            matched = true;
+          }
+        });
+
+        if (!matched) {
+          addStandingEntry(
+            team.team_name || team.original_team_name || `Team ${team.assigned_id ?? team.team_id ?? ''}`,
+            {
+              teamName: team.team_name || team.original_team_name,
+              combinedTotalPoints: Number(team.combinedTotalPoints) || 0,
+              killPoints: Number(team.killPoints) || Number(team.totalKills) || 0,
+            }
+          );
+        }
+      });
+
+      const orderedStandings = Array.from(standingsMap.entries()).sort(([, a], [, b]) => {
+        const diff = (b.combinedTotalPoints || 0) - (a.combinedTotalPoints || 0);
+        if (diff !== 0) return diff;
+        const killDiff = (b.killPoints || 0) - (a.killPoints || 0);
+        if (killDiff !== 0) return killDiff;
+        return (a.teamName || '').localeCompare(b.teamName || '');
+      });
+
+      orderedStandings.forEach(([key, entry], index) => {
+        standingsMap.set(key, { ...entry, rank: index + 1 });
+      });
+
+      roundRobinRankLookup = standingsMap;
+
+      if (roundRobinRankLookup && roundRobinRankLookup.size > 0) {
+        teamsWithStats.forEach((team) => {
+          const candidateNames = Array.isArray(team.nameCandidates) ? team.nameCandidates : [];
+
+          for (const candidate of candidateNames) {
+            const key = normalizeTeamNameKey(candidate);
+            if (key && roundRobinRankLookup.has(key)) {
+              const entry = roundRobinRankLookup.get(key);
+              if (entry && Number.isFinite(entry.rank)) {
+                team.overallRank = entry.rank;
+              }
+              break;
+            }
+          }
+        });
+      }
+    }
+
+    const compareByCombinedTotals = (a, b) => {
+      const totalDiff = (b.combinedTotalPoints || 0) - (a.combinedTotalPoints || 0);
+      if (totalDiff !== 0) return totalDiff;
+      const killsDiff = (b.totalKills || 0) - (a.totalKills || 0);
+      if (killsDiff !== 0) return killsDiff;
+      const rankDiff =
+        (a.overallRank || Number.POSITIVE_INFINITY) -
+        (b.overallRank || Number.POSITIVE_INFINITY);
+      if (rankDiff !== 0) return rankDiff;
+      return (a.team_name || '').localeCompare(b.team_name || '');
+    };
+
+    const compareByCurrentMatch = (a, b) => {
+      const totalDiff =
+        (b.currentMatchTotalPoints || 0) - (a.currentMatchTotalPoints || 0);
+      if (totalDiff !== 0) return totalDiff;
+      const killPointsDiff = (b.killPoints || 0) - (a.killPoints || 0);
+      if (killPointsDiff !== 0) return killPointsDiff;
+      const killsDiff = (b.totalKills || 0) - (a.totalKills || 0);
+      if (killsDiff !== 0) return killsDiff;
+      return compareByCombinedTotals(a, b);
+    };
+
+    const isGroupWiseMode =
+      jsonGroupingMode === 'group' &&
+      tournamentFormat === 'roundRobin' &&
+      activeRoundRobinGroups.length > 0;
+
+    let displayTeams;
+
+    if (isGroupWiseMode) {
+      const groupOrderKeys =
+        jsonGroupOrder.length > 0
+          ? jsonGroupOrder
+          : activeRoundRobinGroups.map((group) => group.key);
+
+      const groupedTeams = new Map();
+
+      teamsWithStats.forEach((team) => {
+        const key = team.groupKey || UNASSIGNED_GROUP_KEY;
+        const label = team.groupName || 'Unassigned';
+        if (!groupedTeams.has(key)) {
+          groupedTeams.set(key, { label, teams: [] });
+        }
+        groupedTeams.get(key).teams.push(team);
+      });
+
+      const processedKeys = new Set();
+      const flattened = [];
+
+      const pushGroup = (key) => {
+        if (processedKeys.has(key)) {
+          return;
+        }
+        const entry = groupedTeams.get(key);
+        if (!entry || !Array.isArray(entry.teams) || entry.teams.length === 0) {
+          processedKeys.add(key);
+          return;
+        }
+        const sorted = [...entry.teams].sort(compareByCombinedTotals);
+        sorted.forEach((team) => {
+          if (!team.groupName) {
+            team.groupName = entry.label;
+          }
+          if (!team.groupKey) {
+            team.groupKey = key;
+          }
+        });
+        flattened.push(...sorted);
+        processedKeys.add(key);
+      };
+
+      groupOrderKeys.forEach(pushGroup);
+
+      groupedTeams.forEach((_, key) => {
+        if (!processedKeys.has(key)) {
+          pushGroup(key);
+        }
+      });
+
+      displayTeams = flattened;
+    } else if (tournamentFormat === 'roundRobin') {
+      displayTeams = [...teamsWithStats].sort(compareByCurrentMatch);
+    } else {
+      displayTeams = combinedRankedTeams;
+    }
+
     const jsonData = {};
     const zoneIn = zoneInImage.trim();
     const zoneOut = zoneOutImage.trim();
 
-    const totalSlots = Math.max(sortedTeams.length, 12);
+    const totalSlots = Math.max(displayTeams.length, 12);
     const baseLogoPath = logoFolderPath.trim() ? logoFolderPath.replace(/[\\/]+$/, '') : '';
     const logoSeparator = baseLogoPath.includes('\\') ? '\\' : '/';
     const baseHpPath = hpFolderPath && hpFolderPath.trim() ? hpFolderPath.replace(/[\\/]+$/, '') : '';
@@ -777,10 +1150,10 @@ const LiveScoring = () => {
 
     const slots = Array.from({ length: totalSlots }, (_, index) => {
       const position = index + 1;
-      const team = sortedTeams[index] || null;
+      const team = displayTeams[index] || null;
       const manualName = manualTeamSlots[position] || '';
       const teamName = team ? team.team_name || `Team ${position}` : manualName;
-      const hasTeamData = Boolean(team);
+      const hasTeamData = Boolean(team) && !team.manualPlaceholder;
 
       let logoPath = '';
       if (baseLogoPath) {
@@ -841,7 +1214,9 @@ const LiveScoring = () => {
       return {
         position,
         teamName,
-        rank: `#${position}`,
+        rank: `#${
+          hasTeamData && Number.isFinite(team.overallRank) ? team.overallRank : position
+        }`,
         logoPath,
         finValue,
         totalPointsValue,
@@ -1580,11 +1955,28 @@ const LiveScoring = () => {
   const handleNextMatch = () => {
     const currentTeams = getFilteredTeams();
 
-    const resetTeams =
+    const resetCandidates =
       Array.isArray(currentTeams) && currentTeams.length > 0
-        ? currentTeams
-            .filter((team) => !team?.manualPlaceholder)
-            .map((team) => {
+        ? currentTeams.filter((team) => {
+            if (!team || team.manualPlaceholder) {
+              return false;
+            }
+
+            const hasPlayers =
+              Array.isArray(team.player_stats) && team.player_stats.length > 0;
+            const hasMeaningfulStats =
+              Number(team.kill_count) > 0 ||
+              Number(team.total_points) > 0 ||
+              Number(team.points) > 0 ||
+              Number(team.score) > 0;
+
+            return hasPlayers || hasMeaningfulStats;
+          })
+        : [];
+
+    const resetTeams =
+      resetCandidates.length > 0
+        ? resetCandidates.map((team) => {
             const resetPlayerStats = Array.isArray(team.player_stats)
               ? team.player_stats.map((player) => {
                   const totalHp =
@@ -1797,6 +2189,113 @@ const LiveScoring = () => {
   const teams = getFilteredTeams();
   const scoringData = extractScoringData(liveData);
   const booyahTeam = teams.find((team) => isBooyahTeam(team));
+  const isRoundRobinFormat = tournamentFormat === 'roundRobin';
+  const isGroupWiseJson =
+    jsonGroupingMode === 'group' && isRoundRobinFormat && activeRoundRobinGroups.length > 0;
+  const jsonPreviewHeading = isGroupWiseJson
+    ? 'JSON Preview (Group-wise order)'
+    : 'JSON Preview (Standings order — highest total first)';
+  const remainingGroupOptions = activeRoundRobinGroups.filter(
+    (group) => !jsonGroupOrder.includes(group.key)
+  );
+  const groupedCumulativeScores = useMemo(() => {
+    const map = new Map();
+
+    if (!isRoundRobinFormat) {
+      return map;
+    }
+
+    const ensureGroupBucket = (key, label) => {
+      const targetKey = key || UNASSIGNED_GROUP_KEY;
+      if (!map.has(targetKey)) {
+        map.set(targetKey, {
+          key: targetKey,
+          label: label || 'Unassigned',
+          entries: [],
+        });
+      } else if (label) {
+        const bucket = map.get(targetKey);
+        if (bucket && (!bucket.label || bucket.label === 'Unassigned')) {
+          bucket.label = label;
+        }
+      }
+      return map.get(targetKey);
+    };
+
+    Object.entries(cumulativeScores || {}).forEach(([rawKey, entry]) => {
+      if (!entry || typeof entry !== 'object') return;
+
+      const teamName = entry.teamName || rawKey || 'Unknown Team';
+      const candidates = [teamName, rawKey];
+
+      if (entry.teamId !== null && entry.teamId !== undefined) {
+        const idString = String(entry.teamId).trim();
+        if (idString) {
+          candidates.push(idString, `Team ${idString}`, `team-${idString}`);
+        }
+      }
+
+      const groupInfo = resolveGroupByCandidates(candidates);
+      const bucket = ensureGroupBucket(groupInfo?.key, groupInfo?.label);
+      bucket.entries.push({
+        ...entry,
+        teamName,
+      });
+    });
+
+    activeRoundRobinGroups.forEach((group) => {
+      ensureGroupBucket(group.key, group.label);
+    });
+
+    map.forEach((bucket) => {
+      bucket.entries.sort((a, b) => {
+        const totalDiff = (b.totalPoints || 0) - (a.totalPoints || 0);
+        if (totalDiff !== 0) return totalDiff;
+        const killDiff = (b.killPoints || 0) - (a.killPoints || 0);
+        if (killDiff !== 0) return killDiff;
+        return (a.teamName || '').localeCompare(b.teamName || '');
+      });
+    });
+
+    return map;
+  }, [cumulativeScores, isRoundRobinFormat, resolveGroupByCandidates, activeRoundRobinGroups]);
+
+  const orderedGroupStandings = useMemo(() => {
+    if (!isGroupWiseJson || groupedCumulativeScores.size === 0) {
+      return [];
+    }
+
+    const processed = new Set();
+    const sections = [];
+    const orderKeys =
+      jsonGroupOrder.length > 0
+        ? jsonGroupOrder
+        : activeRoundRobinGroups.map((group) => group.key);
+
+    const pushSection = (key) => {
+      const section = groupedCumulativeScores.get(key);
+      if (!section || processed.has(key) || !section.entries.length) {
+        return;
+      }
+      sections.push(section);
+      processed.add(key);
+    };
+
+    orderKeys.forEach(pushSection);
+
+    groupedCumulativeScores.forEach((section, key) => {
+      if (!processed.has(key) && section.entries.length) {
+        sections.push(section);
+      }
+    });
+
+    return sections;
+  }, [
+    isGroupWiseJson,
+    groupedCumulativeScores,
+    jsonGroupOrder,
+    activeRoundRobinGroups,
+  ]);
   const savedGroupNames = Object.keys(groupDataMap || {})
     .filter((name) => typeof name === 'string' && name.trim().length > 0)
     .sort((a, b) => a.localeCompare(b));
@@ -2040,6 +2539,94 @@ const LiveScoring = () => {
                 Enter folder path (will create data.json) or full file path. This file will auto-update every 3 seconds.
               </p>
             </div>
+
+            <div className="mt-6">
+              <label className="block text-slate-200 text-sm font-semibold mb-3">
+                JSON Output Mode
+              </label>
+              <div className="flex flex-col md:flex-row md:items-center md:gap-3 gap-3">
+                <select
+                  value={jsonGroupingMode}
+                  onChange={(event) => handleJsonGroupingModeChange(event.target.value)}
+                  className="w-full md:w-auto px-5 py-3 bg-slate-900/80 text-white rounded-xl border-2 border-slate-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500 transition-all shadow-lg font-semibold"
+                >
+                  <option value="overall">Overall standings</option>
+                  <option
+                    value="group"
+                    disabled={!isRoundRobinFormat || activeRoundRobinGroups.length === 0}
+                  >
+                    Group wise (round robin)
+                  </option>
+                </select>
+                {jsonGroupingMode === 'group' && isRoundRobinFormat && (
+                  <span className="text-xs text-slate-400">
+                    Export order follows the sequence you choose for active groups.
+                  </span>
+                )}
+              </div>
+
+              {jsonGroupingMode === 'group' && isRoundRobinFormat && activeRoundRobinGroups.length > 0 && (
+                <div className="mt-4 space-y-3">
+                  <div className="flex flex-col md:flex-row md:items-center md:gap-3 gap-3">
+                    <select
+                      value=""
+                      onChange={(event) => {
+                        handleAddGroupToOrder(event.target.value);
+                        event.target.value = '';
+                      }}
+                      disabled={remainingGroupOptions.length === 0}
+                      className="w-full md:w-auto px-4 py-2.5 bg-slate-900/80 text-white rounded-xl border-2 border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all shadow-md text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <option value="">Add group to export order</option>
+                      {remainingGroupOptions.map((group) => (
+                        <option key={`json-group-option-${group.key}`} value={group.key}>
+                          {group.label}
+                        </option>
+                      ))}
+                    </select>
+
+                    <button
+                      type="button"
+                      onClick={handleResetGroupOrder}
+                      disabled={jsonGroupOrder.length === 0}
+                      className="px-4 py-2 bg-slate-800/80 text-slate-200 rounded-xl border border-slate-600 hover:bg-slate-700/80 transition-all text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Reset Order
+                    </button>
+                  </div>
+
+                  {jsonGroupOrder.length > 0 ? (
+                    <div className="flex flex-wrap gap-2">
+                      {jsonGroupOrder.map((groupKey, index) => {
+                        const groupMeta =
+                          activeRoundRobinGroups.find((group) => group.key === groupKey) || null;
+                        const label = groupMeta?.label || `Group ${index + 1}`;
+                        return (
+                          <span
+                            key={`json-group-order-${groupKey}`}
+                            className="px-3 py-1.5 bg-blue-500/20 border border-blue-400 text-blue-100 rounded-full text-xs font-semibold flex items-center gap-2"
+                          >
+                            <span>{index + 1}. {label}</span>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveGroupFromOrder(groupKey)}
+                              className="w-5 h-5 flex items-center justify-center rounded-full bg-blue-500/30 hover:bg-blue-500/60 transition-all text-[10px] font-black"
+                              aria-label={`Remove ${label}`}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-400">
+                      Select groups in the order they should appear in the JSON export.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
             
             <button
               onClick={writeJsonToFile}
@@ -2070,7 +2657,7 @@ const LiveScoring = () => {
             {liveData && getFilteredTeams().length > 0 && (
               <div className="mt-4">
                 <p className="text-slate-300 text-sm font-semibold mb-2">
-                  JSON Preview (Teams sorted by kills - highest first):
+                  {jsonPreviewHeading}:
                 </p>
                 <div className="bg-slate-900/80 rounded-xl p-4 overflow-x-auto border border-slate-700">
                   <pre className="text-green-400 text-xs font-mono">
@@ -2265,44 +2852,89 @@ const LiveScoring = () => {
           )}
 
           {cumulativeScoresList.length > 0 && (
-            <div className="mt-6">
-              <p className="text-slate-300 text-sm font-semibold mb-3">
-                Cumulative Standings — {sanitizeGroupName(groupName) || 'No group selected'}
-              </p>
-              <div className="overflow-x-auto bg-slate-900/70 border border-slate-700 rounded-xl">
-                <table className="min-w-full text-sm text-left text-slate-300">
-                  <thead className="text-xs uppercase tracking-wider text-slate-400 bg-slate-900/90">
-                    <tr>
-                      <th className="px-4 py-3">Pos</th>
-                      <th className="px-4 py-3">Team</th>
-                      <th className="px-4 py-3">Matches</th>
-                      <th className="px-4 py-3">Booyah</th>
-                      <th className="px-4 py-3">Kills</th>
-                      <th className="px-4 py-3">Placement</th>
-                      <th className="px-4 py-3">Prev Total</th>
-                      <th className="px-4 py-3">Total</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {cumulativeScoresList.map((entry, index) => (
-                      <tr
-                        key={`${entry.teamName}-${index}`}
-                        className={`border-t border-slate-800/70 ${index % 2 === 0 ? 'bg-slate-900/50' : 'bg-slate-900/40'}`}
-                      >
-                        <td className="px-4 py-3 font-bold text-slate-100">#{index + 1}</td>
-                        <td className="px-4 py-3 font-semibold text-slate-100">{entry.teamName}</td>
-                        <td className="px-4 py-3">{entry.matches}</td>
-                        <td className="px-4 py-3">{entry.booyahCount}</td>
-                        <td className="px-4 py-3 text-red-300">{entry.killPoints}</td>
-                        <td className="px-4 py-3 text-yellow-300">{entry.placementPoints}</td>
-                        <td className="px-4 py-3 text-slate-300">{entry.previousTotalPoints}</td>
-                        <td className="px-4 py-3 text-green-300 font-bold">{entry.totalPoints}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+            isGroupWiseJson && orderedGroupStandings.length > 0 ? (
+              <div className="mt-6 space-y-8">
+                {orderedGroupStandings.map((section) => (
+                  <div key={`group-standings-${section.key}`}>
+                    <p className="text-slate-300 text-sm font-semibold mb-3">
+                      Group Standings — {section.label}
+                    </p>
+                    <div className="overflow-x-auto bg-slate-900/70 border border-slate-700 rounded-xl">
+                      <table className="min-w-full text-sm text-left text-slate-300">
+                        <thead className="text-xs uppercase tracking-wider text-slate-400 bg-slate-900/90">
+                          <tr>
+                            <th className="px-4 py-3">Pos</th>
+                            <th className="px-4 py-3">Team</th>
+                            <th className="px-4 py-3">Matches</th>
+                            <th className="px-4 py-3">Booyah</th>
+                            <th className="px-4 py-3">Kills</th>
+                            <th className="px-4 py-3">Placement</th>
+                            <th className="px-4 py-3">Prev Total</th>
+                            <th className="px-4 py-3">Total</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {section.entries.map((entry, index) => (
+                            <tr
+                              key={`${section.key}-${entry.teamName}-${index}`}
+                              className={`border-t border-slate-800/70 ${index % 2 === 0 ? 'bg-slate-900/50' : 'bg-slate-900/40'}`}
+                            >
+                              <td className="px-4 py-3 font-bold text-slate-100">#{index + 1}</td>
+                              <td className="px-4 py-3 font-semibold text-slate-100">{entry.teamName}</td>
+                              <td className="px-4 py-3">{entry.matches || 0}</td>
+                              <td className="px-4 py-3">{entry.booyahCount || 0}</td>
+                              <td className="px-4 py-3 text-red-300">{entry.killPoints || 0}</td>
+                              <td className="px-4 py-3 text-yellow-300">{entry.placementPoints || 0}</td>
+                              <td className="px-4 py-3 text-slate-300">{entry.previousTotalPoints || 0}</td>
+                              <td className="px-4 py-3 text-green-300 font-bold">{entry.totalPoints || 0}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ))}
               </div>
-            </div>
+            ) : (
+              <div className="mt-6">
+                <p className="text-slate-300 text-sm font-semibold mb-3">
+                  Cumulative Standings — {sanitizeGroupName(groupName) || 'No group selected'}
+                </p>
+                <div className="overflow-x-auto bg-slate-900/70 border border-slate-700 rounded-xl">
+                  <table className="min-w-full text-sm text-left text-slate-300">
+                    <thead className="text-xs uppercase tracking-wider text-slate-400 bg-slate-900/90">
+                      <tr>
+                        <th className="px-4 py-3">Pos</th>
+                        <th className="px-4 py-3">Team</th>
+                        <th className="px-4 py-3">Matches</th>
+                        <th className="px-4 py-3">Booyah</th>
+                        <th className="px-4 py-3">Kills</th>
+                        <th className="px-4 py-3">Placement</th>
+                        <th className="px-4 py-3">Prev Total</th>
+                        <th className="px-4 py-3">Total</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {cumulativeScoresList.map((entry, index) => (
+                        <tr
+                          key={`${entry.teamName}-${index}`}
+                          className={`border-t border-slate-800/70 ${index % 2 === 0 ? 'bg-slate-900/50' : 'bg-slate-900/40'}`}
+                        >
+                          <td className="px-4 py-3 font-bold text-slate-100">#{index + 1}</td>
+                          <td className="px-4 py-3 font-semibold text-slate-100">{entry.teamName}</td>
+                          <td className="px-4 py-3">{entry.matches}</td>
+                          <td className="px-4 py-3">{entry.booyahCount}</td>
+                          <td className="px-4 py-3 text-red-300">{entry.killPoints}</td>
+                          <td className="px-4 py-3 text-yellow-300">{entry.placementPoints}</td>
+                          <td className="px-4 py-3 text-slate-300">{entry.previousTotalPoints}</td>
+                          <td className="px-4 py-3 text-green-300 font-bold">{entry.totalPoints}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )
           )}
         </div>
 
