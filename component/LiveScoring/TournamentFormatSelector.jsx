@@ -48,9 +48,13 @@ const TournamentFormatSelector = ({ format = 'linear', onFormatChange, roundRobi
         return '';
       });
 
+      const enabled =
+        existingGroup && typeof existingGroup.enabled === 'boolean' ? existingGroup.enabled : true;
+
       return {
         name: existingName,
         teams,
+        enabled,
       };
     });
 
@@ -90,9 +94,13 @@ const TournamentFormatSelector = ({ format = 'linear', onFormatChange, roundRobi
         return '';
       });
 
+      const enabled =
+        existingGroup && typeof existingGroup.enabled === 'boolean' ? existingGroup.enabled : true;
+
       return {
         name,
         teams,
+        enabled,
       };
     });
 
@@ -123,6 +131,23 @@ const TournamentFormatSelector = ({ format = 'linear', onFormatChange, roundRobi
         teams,
       };
     });
+  const handleGroupEnabledToggle = (groupIndex, checked) => {
+    const groups = safeConfig.groups.map((group, index) =>
+      index === groupIndex
+        ? {
+            ...group,
+            enabled: checked,
+          }
+        : group
+    );
+
+    emitConfigUpdate({
+      groupCount: safeConfig.groupCount,
+      teamsPerGroup: safeConfig.teamsPerGroup,
+      groups,
+    });
+  };
+
 
     emitConfigUpdate({
       groupCount: safeConfig.groupCount,
@@ -224,7 +249,20 @@ const TournamentFormatSelector = ({ format = 'linear', onFormatChange, roundRobi
               className="border border-slate-700/60 rounded-2xl p-4 bg-slate-900/60 shadow-inner space-y-4"
             >
               <div>
-                <label className="block text-slate-200 text-xs font-semibold mb-2">Group Name</label>
+                <div className="flex items-center justify-between gap-3 mb-2">
+                  <label className="block text-slate-200 text-xs font-semibold">
+                    Group Name
+                  </label>
+                  <label className="flex items-center gap-2 text-xs font-semibold text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={group.enabled !== false}
+                      onChange={(event) => handleGroupEnabledToggle(groupIndex, event.target.checked)}
+                      className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-blue-500 focus:ring-blue-500"
+                    />
+                    Active
+                  </label>
+                </div>
                 <input
                   type="text"
                   value={group.name}

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 
 const sanitizeGroupName = (name) => {
   if (typeof name !== 'string') return '';
@@ -124,6 +124,7 @@ const createDefaultRoundRobinConfig = (groupCount = 3, teamsPerGroup = 2) => {
     groups: Array.from({ length: sanitizedGroupCount }, (_, index) => ({
       name: `Group ${ROUND_ROBIN_ALPHABET[index] || index + 1}`,
       teams: Array.from({ length: sanitizedTeamsPerGroup }, () => ''),
+      enabled: true,
     })),
   };
 };
@@ -159,6 +160,7 @@ const normalizeRoundRobinConfig = (config) => {
     return {
       name,
       teams,
+      enabled: existingGroup && typeof existingGroup.enabled === 'boolean' ? existingGroup.enabled : true,
     };
   });
 
@@ -203,6 +205,8 @@ const LiveScoring = () => {
   const [manualTeamSlots, setManualTeamSlots] = useState({});
   const [tournamentFormat, setTournamentFormat] = useState('linear');
   const [roundRobinConfig, setRoundRobinConfig] = useState(() => createDefaultRoundRobinConfig());
+  const [configTransferStatus, setConfigTransferStatus] = useState(null);
+  const configFileInputRef = useRef(null);
   const sourceTeams = useMemo(() => extractTeams(liveData), [liveData]);
   const roundRobinTeamOptions = useMemo(() => {
     const seen = new Set();
@@ -210,6 +214,9 @@ const LiveScoring = () => {
 
     if (roundRobinConfig && Array.isArray(roundRobinConfig.groups)) {
       roundRobinConfig.groups.forEach((group) => {
+        if (group && group.enabled === false) {
+          return;
+        }
         if (!group || !Array.isArray(group.teams)) return;
         group.teams.forEach((teamName) => {
           const sanitized = sanitizeLabel(teamName);
@@ -264,6 +271,254 @@ const LiveScoring = () => {
   const handleRoundRobinConfigChange = useCallback((nextConfig) => {
     setRoundRobinConfig(normalizeRoundRobinConfig(nextConfig));
   }, []);
+
+  const handleRoundRobinGroupToggle = useCallback((groupIndex, isEnabled) => {
+    setRoundRobinConfig((prev) => {
+      const normalized = normalizeRoundRobinConfig(prev);
+      const groups = normalized.groups.map((group, index) =>
+        index === groupIndex
+          ? {
+              ...group,
+              enabled: isEnabled,
+            }
+          : group
+      );
+      return {
+        ...normalized,
+        groups,
+      };
+    });
+  }, []);
+
+  const handleTriggerConfigImport = useCallback(() => {
+    if (configFileInputRef.current) {
+      configFileInputRef.current.value = '';
+      configFileInputRef.current.click();
+    }
+  }, []);
+
+  const handleExportConfiguration = useCallback(() => {
+    try {
+      const payload = {
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        matchId,
+        clientId,
+        isInitialLoad,
+        liveData,
+        teamNameSuggestions,
+        matchSaveStatus,
+        jsonWriteStatus,
+        tournamentFormat,
+        roundRobinConfig,
+        groupName,
+        roundLabel,
+        matchLabel,
+        groupDataMap,
+        teamNameOverrides,
+        manualTeamSlots,
+        cumulativeScores,
+        matchHistory,
+        jsonFilePath,
+        logoFolderPath,
+        hpFolderPath,
+        zoneInImage,
+        zoneOutImage,
+      };
+
+      const serialized = JSON.stringify(payload, null, 2);
+      const blob = new Blob([serialized], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      link.href = url;
+      link.download = `live-scoring-export-${timestamp}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+
+      setConfigTransferStatus({
+        type: 'success',
+        message: 'Configuration exported successfully.',
+      });
+    } catch (err) {
+      console.error('Failed to export configuration:', err);
+      setConfigTransferStatus({
+        type: 'error',
+        message: 'Failed to export configuration.',
+      });
+    }
+  }, [
+    tournamentFormat,
+    roundRobinConfig,
+    groupName,
+    roundLabel,
+    matchLabel,
+    groupDataMap,
+    teamNameOverrides,
+    manualTeamSlots,
+    cumulativeScores,
+    matchHistory,
+    jsonFilePath,
+    logoFolderPath,
+    hpFolderPath,
+    zoneInImage,
+    zoneOutImage,
+  ]);
+
+  const handleImportedConfiguration = useCallback(
+    (parsed) => {
+      if (!parsed || typeof parsed !== 'object') {
+        throw new Error('Invalid configuration format.');
+      }
+
+      const importedFormat = parsed.tournamentFormat === 'roundRobin' ? 'roundRobin' : 'linear';
+      setTournamentFormat(importedFormat);
+
+      if (parsed.roundRobinConfig) {
+        setRoundRobinConfig(normalizeRoundRobinConfig(parsed.roundRobinConfig));
+      }
+
+      if (typeof parsed.matchId === 'string' || typeof parsed.matchId === 'number') {
+        setMatchId(String(parsed.matchId));
+      }
+
+      if (typeof parsed.clientId === 'string' || typeof parsed.clientId === 'number') {
+        setClientId(String(parsed.clientId));
+      }
+
+      if (parsed.groupDataMap && typeof parsed.groupDataMap === 'object') {
+        setGroupDataMap(() => {
+          const sanitized = {};
+          Object.entries(parsed.groupDataMap).forEach(([key, value]) => {
+            if (typeof key !== 'string' || !key.trim()) {
+              return;
+            }
+            if (!value || typeof value !== 'object') {
+              return;
+            }
+            sanitized[sanitizeGroupName(key)] = {
+              cumulativeScores: value.cumulativeScores || {},
+              matchHistory: Array.isArray(value.matchHistory) ? value.matchHistory : [],
+              roundLabel: value.roundLabel || DEFAULT_ROUND_LABEL,
+              matchLabel: value.matchLabel || DEFAULT_MATCH_LABEL,
+              lastUpdatedAt: value.lastUpdatedAt || null,
+              lastExportedFile: value.lastExportedFile || '',
+              lastCompletedMatchLabel: value.lastCompletedMatchLabel || '',
+            };
+          });
+          return Object.keys(sanitized).length > 0
+            ? sanitized
+            : {
+                [DEFAULT_GROUP_NAME]: {
+                  cumulativeScores: {},
+                  matchHistory: [],
+                  roundLabel: DEFAULT_ROUND_LABEL,
+                  matchLabel: DEFAULT_MATCH_LABEL,
+                },
+              };
+        });
+      }
+
+      if (parsed.teamNameOverrides && typeof parsed.teamNameOverrides === 'object') {
+        setTeamNameOverrides(parsed.teamNameOverrides);
+      }
+
+      if (parsed.manualTeamSlots && typeof parsed.manualTeamSlots === 'object') {
+        setManualTeamSlots(parsed.manualTeamSlots);
+      }
+
+      if (Array.isArray(parsed.teamNameSuggestions)) {
+        setTeamNameSuggestions(parsed.teamNameSuggestions);
+      }
+
+      const importedGroupName = sanitizeGroupName(parsed.groupName) || DEFAULT_GROUP_NAME;
+      const importedRoundLabel = sanitizeLabel(parsed.roundLabel, DEFAULT_ROUND_LABEL) || DEFAULT_ROUND_LABEL;
+      const importedMatchLabel = sanitizeLabel(parsed.matchLabel, DEFAULT_MATCH_LABEL) || DEFAULT_MATCH_LABEL;
+
+      setGroupName(importedGroupName);
+      setRoundLabel(importedRoundLabel);
+      setMatchLabel(importedMatchLabel);
+
+      if (Array.isArray(parsed.matchHistory)) {
+        setMatchHistory(parsed.matchHistory);
+      }
+
+      if (parsed.cumulativeScores && typeof parsed.cumulativeScores === 'object') {
+        setCumulativeScores(parsed.cumulativeScores);
+      }
+
+      if (typeof parsed.isInitialLoad === 'boolean') {
+        setIsInitialLoad(parsed.isInitialLoad);
+      }
+
+      if (parsed.liveData && typeof parsed.liveData === 'object') {
+        setLiveData(parsed.liveData);
+      }
+
+      if (parsed.matchSaveStatus && typeof parsed.matchSaveStatus === 'object') {
+        setMatchSaveStatus(parsed.matchSaveStatus);
+      }
+
+      if (parsed.jsonWriteStatus && typeof parsed.jsonWriteStatus === 'object') {
+        setJsonWriteStatus(parsed.jsonWriteStatus);
+      }
+
+      if (typeof parsed.jsonFilePath === 'string') {
+        setJsonFilePath(parsed.jsonFilePath);
+      }
+
+      if (typeof parsed.logoFolderPath === 'string') {
+        setLogoFolderPath(parsed.logoFolderPath);
+      }
+
+      if (typeof parsed.hpFolderPath === 'string') {
+        setHpFolderPath(parsed.hpFolderPath);
+      }
+
+      if (typeof parsed.zoneInImage === 'string') {
+        setZoneInImage(parsed.zoneInImage);
+      }
+
+      if (typeof parsed.zoneOutImage === 'string') {
+        setZoneOutImage(parsed.zoneOutImage);
+      }
+
+      setConfigTransferStatus({
+        type: 'success',
+        message: 'Configuration imported successfully.',
+      });
+    },
+    []
+  );
+
+  const handleConfigImportChange = useCallback(
+    (event) => {
+      const file = event?.target?.files?.[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = (loadEvent) => {
+        try {
+          const text = loadEvent?.target?.result;
+          if (typeof text !== 'string') {
+            throw new Error('Unable to read configuration file.');
+          }
+          const parsed = JSON.parse(text);
+          handleImportedConfiguration(parsed);
+        } catch (err) {
+          console.error('Failed to import configuration:', err);
+          setConfigTransferStatus({
+            type: 'error',
+            message: 'Failed to import configuration. Please verify the file.',
+          });
+        }
+      };
+      reader.readAsText(file);
+    },
+    [handleImportedConfiguration]
+  );
 
   const handleActiveGroupChange = useCallback(
     (value) => {
@@ -1627,6 +1882,54 @@ const LiveScoring = () => {
           <p className="text-slate-400 text-lg font-medium">Live Scoring System • Real-time match statistics</p>
         </div>
 
+        <div className="bg-gradient-to-br from-slate-800/90 via-slate-800/80 to-slate-900/90 rounded-2xl p-5 md:p-6 mb-8 shadow-2xl border border-slate-700/50 backdrop-blur-sm">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+            <div>
+              <h3 className="text-lg font-black text-transparent bg-clip-text bg-gradient-to-r from-teal-300 via-emerald-300 to-green-400">
+                Configuration Transfer
+              </h3>
+              <p className="text-slate-400 text-xs md:text-sm mt-1">
+                Import or export your full scoring setup, including tournament format, groups, and standings.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={handleExportConfiguration}
+                className="px-5 py-2.5 bg-gradient-to-r from-green-600 via-emerald-600 to-green-500 hover:from-green-500 hover:via-emerald-500 hover:to-green-400 text-white font-semibold rounded-xl transition-all shadow-lg hover:shadow-2xl hover:shadow-green-500/40 transform hover:scale-105 active:scale-95"
+              >
+                ⬇️ Export Setup
+              </button>
+              <button
+                type="button"
+                onClick={handleTriggerConfigImport}
+                className="px-5 py-2.5 bg-gradient-to-r from-blue-600 via-sky-600 to-blue-500 hover:from-blue-500 hover:via-sky-500 hover:to-blue-400 text-white font-semibold rounded-xl transition-all shadow-lg hover:shadow-2xl hover:shadow-blue-500/40 transform hover:scale-105 active:scale-95"
+              >
+                ⬆️ Import Setup
+              </button>
+              <input
+                ref={configFileInputRef}
+                type="file"
+                accept="application/json,.json"
+                className="hidden"
+                onChange={handleConfigImportChange}
+              />
+            </div>
+          </div>
+          {configTransferStatus && (
+            <div
+              className={`mt-4 px-4 py-3 rounded-xl text-sm font-semibold ${
+                configTransferStatus.type === 'success'
+                  ? 'bg-green-900/40 border border-green-700 text-green-200'
+                  : 'bg-red-900/40 border border-red-700 text-red-200'
+              }`}
+            >
+              {configTransferStatus.type === 'success' ? '✅ ' : '❌ '}
+              {configTransferStatus.message}
+            </div>
+          )}
+        </div>
+
         <div className="bg-gradient-to-br from-slate-800/90 via-slate-800/80 to-slate-900/90 rounded-2xl p-6 md:p-8 mb-8 shadow-2xl border border-slate-700/50 backdrop-blur-sm">
           <h3 className="text-xl font-black text-transparent bg-clip-text bg-gradient-to-r from-blue-300 via-cyan-300 to-purple-300 mb-4">
             🎯 Tournament Format
@@ -2011,6 +2314,42 @@ const LiveScoring = () => {
               Left column shows the team names fetched from the match. Enter your preferred display name on the right.
             </p>
           </div>
+          {tournamentFormat === 'roundRobin' &&
+            Array.isArray(roundRobinConfig?.groups) &&
+            roundRobinConfig.groups.length > 0 && (
+              <div className="mb-5">
+                <p className="text-slate-300 text-xs font-semibold mb-2 uppercase tracking-wider">
+                  Active Groups For Dropdowns
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {roundRobinConfig.groups.map((group, index) => {
+                    const label =
+                      typeof group?.name === 'string' && group.name.trim().length > 0
+                        ? group.name.trim()
+                        : `Group ${ROUND_ROBIN_ALPHABET[index] || index + 1}`;
+                    const enabled = group?.enabled !== false;
+                    return (
+                      <label
+                        key={`round-robin-group-toggle-${index}`}
+                        className={`flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-semibold transition-all ${
+                          enabled
+                            ? 'bg-blue-500/20 border-blue-500/60 text-blue-100'
+                            : 'bg-slate-800/60 border-slate-600 text-slate-400'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={enabled}
+                          onChange={(event) => handleRoundRobinGroupToggle(index, event.target.checked)}
+                          className="w-4 h-4 rounded border-slate-600 bg-slate-900 text-blue-500 focus:ring-blue-500"
+                        />
+                        {label}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           <div className="space-y-3">
             {Array.isArray(sourceTeams) && sourceTeams.length > 0 ? (
               sourceTeams.map((team, index) => {
