@@ -22,6 +22,8 @@ const sanitizeLabel = (value, fallback = '') => {
 const DEFAULT_GROUP_NAME = 'GroupA';
 const DEFAULT_ROUND_LABEL = 'R1';
 const DEFAULT_MATCH_LABEL = 'M1';
+const DEFAULT_ELIMINATION_IMAGE_BASE_PATH = 'D:\\Production Assets\\TEAM PLAYER IMAGES';
+const DEFAULT_VMIX_HOST = '192.168.110.12:8088';
 
 const incrementMatchLabel = (label) => {
   const sanitized = sanitizeLabel(label, DEFAULT_MATCH_LABEL) || DEFAULT_MATCH_LABEL;
@@ -235,12 +237,9 @@ const LiveScoring = () => {
   const [hpFolderPath, setHpFolderPath] = useState('D:\\Production Assets\\Alive health pins'); // NEW: HP images folder path
   const [zoneInImage, setZoneInImage] = useState('D:\\Production Assets\\INZONE\\100001.png');
   const [zoneOutImage, setZoneOutImage] = useState('D:\\Production Assets\\OUTZONE\\100001.png');
-  const [eliminationImageBasePath, setEliminationImageBasePath] = useState(
-    'D:\\Production Assets\\TEAM PLAYER IMAGES'
-  );
-  const [vmixIpAddress, setVmixIpAddress] = useState('192.168.110.12:8088');
   const [cumulativeScores, setCumulativeScores] = useState({});
   const [matchHistory, setMatchHistory] = useState([]);
+  const [eliminationHistory, setEliminationHistory] = useState([]);
   const [matchSaveStatus, setMatchSaveStatus] = useState(null);
   const [groupName, setGroupName] = useState(DEFAULT_GROUP_NAME);
   const [groupDataMap, setGroupDataMap] = useState(() => ({
@@ -258,7 +257,7 @@ const LiveScoring = () => {
   const [roundRobinConfig, setRoundRobinConfig] = useState(() => createDefaultRoundRobinConfig());
   const [configTransferStatus, setConfigTransferStatus] = useState(null);
   const configFileInputRef = useRef(null);
-  const lastEliminationTriggerRef = useRef(null);
+  const eliminatedTeamKeysRef = useRef(new Set());
   const eliminationAnimationTimeoutRef = useRef(null);
   const sourceTeams = useMemo(() => extractTeams(liveData), [liveData]);
   const roundRobinTeamOptions = useMemo(() => {
@@ -485,7 +484,7 @@ const LiveScoring = () => {
     }
   }, []);
 
-  const handleExportConfiguration = useCallback(async () => {
+  const handleExportConfiguration = useCallback(() => {
     try {
       const payload = {
         version: 1,
@@ -512,69 +511,15 @@ const LiveScoring = () => {
         hpFolderPath,
         zoneInImage,
         zoneOutImage,
-        eliminationImageBasePath,
-        vmixIpAddress,
       };
 
       const serialized = JSON.stringify(payload, null, 2);
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const suggestedName = `live-scoring-export-${timestamp}.json`;
-
-      if (typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function') {
-        try {
-          const fileHandle = await window.showSaveFilePicker({
-            suggestedName,
-            types: [
-              {
-                description: 'JSON Files',
-                accept: { 'application/json': ['.json'] },
-              },
-            ],
-          });
-
-          const writable = await fileHandle.createWritable();
-          await writable.write(serialized);
-          await writable.close();
-
-          setConfigTransferStatus({
-            type: 'success',
-            message: `Configuration saved to ${fileHandle.name || 'selected file'}.`,
-          });
-          return;
-        } catch (pickerError) {
-          if (pickerError?.name === 'AbortError') {
-            setConfigTransferStatus({
-              type: 'error',
-              message: 'Export cancelled.',
-            });
-            return;
-          }
-
-          console.error('File picker failed, falling back to download:', pickerError);
-        }
-      }
-
-      let chosenName = suggestedName;
-      if (typeof window !== 'undefined') {
-        const userInput = window.prompt(
-          'Enter a file name (optional path) for the configuration export:',
-          suggestedName
-        );
-        if (!userInput) {
-          setConfigTransferStatus({
-            type: 'error',
-            message: 'Export cancelled.',
-          });
-          return;
-        }
-        chosenName = userInput.trim() || suggestedName;
-      }
-
       const blob = new Blob([serialized], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       link.href = url;
-      link.download = chosenName.split(/[\\/]/).pop() || suggestedName;
+      link.download = `live-scoring-export-${timestamp}.json`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -607,8 +552,6 @@ const LiveScoring = () => {
     hpFolderPath,
     zoneInImage,
     zoneOutImage,
-    eliminationImageBasePath,
-    vmixIpAddress,
   ]);
 
   const handleImportedConfiguration = useCallback(
@@ -727,14 +670,6 @@ const LiveScoring = () => {
 
       if (typeof parsed.zoneOutImage === 'string') {
         setZoneOutImage(parsed.zoneOutImage);
-      }
-
-      if (typeof parsed.eliminationImageBasePath === 'string') {
-        setEliminationImageBasePath(parsed.eliminationImageBasePath);
-      }
-
-      if (typeof parsed.vmixIpAddress === 'string') {
-        setVmixIpAddress(parsed.vmixIpAddress);
       }
 
       setConfigTransferStatus({
@@ -893,6 +828,18 @@ const LiveScoring = () => {
     fetchLiveScoring();
   }, []);
 
+  useEffect(() => {
+    eliminatedTeamKeysRef.current = new Set();
+    setEliminationHistory([]);
+  }, [matchId]);
+
+  useEffect(() => {
+    if (liveData === null) {
+      eliminatedTeamKeysRef.current = new Set();
+      setEliminationHistory([]);
+    }
+  }, [liveData]);
+
   // Auto-refresh every 3 seconds (silent background updates)
   useEffect(() => {
     // Only start auto-refresh if we have data (initial load completed)
@@ -914,6 +861,9 @@ const LiveScoring = () => {
     }
     return 0;
   };
+
+  const eliminationImageBasePath = DEFAULT_ELIMINATION_IMAGE_BASE_PATH;
+  const vmixHost = DEFAULT_VMIX_HOST;
 
   const isTeamEliminated = useCallback((team) => {
     if (!team || typeof team !== 'object') return false;
@@ -938,18 +888,40 @@ const LiveScoring = () => {
     return false;
   }, []);
 
+  const getTeamEliminationKey = useCallback((team) => {
+    if (!team || typeof team !== 'object') return null;
+
+    const candidates = [
+      team.assigned_id,
+      team.team_id,
+      team.id,
+      team.team_name,
+      team.original_team_name,
+    ];
+
+    for (const candidate of candidates) {
+      if (candidate === null || candidate === undefined) {
+        continue;
+      }
+      const stringValue = String(candidate).trim();
+      if (stringValue) {
+        return stringValue.toLowerCase();
+      }
+    }
+
+    return null;
+  }, []);
+
   const buildEliminationPlayerImagePath = useCallback(
     (teamName, playerIndex) => {
-      if (!teamName || !eliminationImageBasePath.trim()) return '';
+      if (!teamName || !eliminationImageBasePath) return '';
 
-      const sanitizedBasePath = eliminationImageBasePath.trim().replace(/[\\/]+$/, '');
+      const sanitizedBasePath = eliminationImageBasePath.replace(/[\\/]+$/, '');
+      if (!sanitizedBasePath) return '';
+
       const separator = sanitizedBasePath.includes('\\') ? '\\' : '/';
       const cleanedTeamName = teamName.replace(/[<>:"|?*]/g, '').trim();
-
-      if (!sanitizedBasePath) return '';
-      if (!cleanedTeamName) {
-        return `${sanitizedBasePath}${separator}${playerIndex + 1}.png`;
-      }
+      if (!cleanedTeamName) return '';
 
       return `${sanitizedBasePath}${separator}${cleanedTeamName}${separator}${playerIndex + 1}.png`;
     },
@@ -957,9 +929,8 @@ const LiveScoring = () => {
   );
 
   const triggerEliminationAnimation = useCallback(async () => {
-    const rawHost = vmixIpAddress.trim();
+    const rawHost = typeof vmixHost === 'string' ? vmixHost.trim() : '';
     if (!rawHost) {
-      console.warn('vMix IP address is not set. Skipping elimination animation trigger.');
       return;
     }
 
@@ -970,7 +941,6 @@ const LiveScoring = () => {
 
     try {
       await fetch(transitionInUrl, { method: 'GET' });
-      console.log('Triggered vMix TransitionIn for elimination:', transitionInUrl);
     } catch (err) {
       console.error('Failed to trigger vMix TransitionIn animation:', err);
     }
@@ -980,54 +950,46 @@ const LiveScoring = () => {
     }
 
     eliminationAnimationTimeoutRef.current = setTimeout(() => {
-      fetch(transitionOutUrl, { method: 'GET' })
-        .then(() => {
-          console.log('Triggered vMix TransitionOut for elimination:', transitionOutUrl);
-        })
-        .catch((err) => {
-          console.error('Failed to trigger vMix TransitionOut animation:', err);
-        });
+      fetch(transitionOutUrl, { method: 'GET' }).catch((err) => {
+        console.error('Failed to trigger vMix TransitionOut animation:', err);
+      });
     }, 2000);
-  }, [vmixIpAddress]);
+  }, [vmixHost]);
 
-  useEffect(() => {
-    const teams = getFilteredTeams();
+  const handleTeamElimination = useCallback(
+    (team, totalTeams) => {
+      const eliminationKey = getTeamEliminationKey(team);
+      if (!eliminationKey || eliminatedTeamKeysRef.current.has(eliminationKey)) {
+        return;
+      }
 
-    if (!teams || teams.length === 0) {
-      lastEliminationTriggerRef.current = null;
-      return;
-    }
+      eliminatedTeamKeysRef.current.add(eliminationKey);
 
-    const eliminatedTeam = teams.find((team) => isTeamEliminated(team));
+      const eliminationOrder = eliminatedTeamKeysRef.current.size;
+      const eliminationRank = Math.max(1, totalTeams - eliminationOrder + 1);
 
-    if (!eliminatedTeam) {
-      lastEliminationTriggerRef.current = null;
-      return;
-    }
+      let teamSnapshot = team;
+      try {
+        teamSnapshot = JSON.parse(JSON.stringify(team));
+      } catch (err) {
+        teamSnapshot = { ...team };
+      }
 
-    const eliminationKey =
-      eliminatedTeam.assigned_id ??
-      eliminatedTeam.team_id ??
-      eliminatedTeam.id ??
-      eliminatedTeam.team_name ??
-      (Number.isFinite(eliminatedTeam.position) ? `position-${eliminatedTeam.position}` : null);
+      setEliminationHistory((prev) => [
+        ...prev,
+        {
+          key: eliminationKey,
+          eliminationRank,
+          totalTeamsAtElimination: totalTeams,
+          eliminatedAt: Date.now(),
+          teamSnapshot,
+        },
+      ]);
 
-    if (!eliminationKey) {
-      return;
-    }
-
-    if (lastEliminationTriggerRef.current !== eliminationKey) {
-      lastEliminationTriggerRef.current = eliminationKey;
       triggerEliminationAnimation();
-    }
-  }, [
-    liveData,
-    triggerEliminationAnimation,
-    isTeamEliminated,
-    teamNameOverrides,
-    manualTeamSlots,
-    roundRobinConfig,
-  ]);
+    },
+    [getTeamEliminationKey, triggerEliminationAnimation]
+  );
 
   useEffect(() => {
     return () => {
@@ -1036,6 +998,27 @@ const LiveScoring = () => {
       }
     };
   }, []);
+
+  useEffect(() => {
+    const teams = getFilteredTeams();
+    if (!Array.isArray(teams) || teams.length === 0) {
+      return;
+    }
+
+    const totalTeams = teams.length;
+    teams.forEach((team) => {
+      if (isTeamEliminated(team)) {
+        handleTeamElimination(team, totalTeams);
+      }
+    });
+  }, [
+    liveData,
+    teamNameOverrides,
+    manualTeamSlots,
+    roundRobinConfig,
+    isTeamEliminated,
+    handleTeamElimination,
+  ]);
 
   // NEW: Function to generate vMix-compatible JSON
   const generateVmixJson = () => {
@@ -1529,56 +1512,73 @@ const LiveScoring = () => {
       });
     });
 
-    const eliminatedTeamEntry = combinedRankedTeams.find((team) => isTeamEliminated(team));
+    const latestEliminationEntry =
+      eliminationHistory.length > 0 ? eliminationHistory[eliminationHistory.length - 1] : null;
 
-    if (eliminatedTeamEntry) {
-      const eliminationTeamName =
-        eliminatedTeamEntry.team_name ||
-        eliminatedTeamEntry.original_team_name ||
-        eliminatedTeamEntry.name ||
-        eliminatedTeamEntry.nameCandidates?.[0] ||
-        'Unknown Team';
+    if (latestEliminationEntry) {
+      const eliminationKey = latestEliminationEntry.key;
+      const eliminationRankValue = latestEliminationEntry.eliminationRank;
 
-      const eliminationRankCandidates = [
-        eliminatedTeamEntry.overallRank,
-        eliminatedTeamEntry.rank_position,
-        eliminatedTeamEntry.rank,
-        eliminatedTeamEntry.placement,
-        eliminatedTeamEntry.position,
-      ];
-      const eliminationRankValue = eliminationRankCandidates.find((value) => Number.isFinite(Number(value)));
-      const formattedRank =
-        eliminationRankValue !== undefined && eliminationRankValue !== null
-          ? `#${Number(eliminationRankValue)}`
-          : '';
+      const eliminationTeamData =
+        combinedRankedTeams.find((team) => getTeamEliminationKey(team) === eliminationKey) ||
+        latestEliminationEntry.teamSnapshot ||
+        null;
 
-      let eliminationLogoPath = '';
-      if (baseLogoPath) {
-        const normalizedElimName = eliminationTeamName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-        const logoFileName = normalizedElimName ? `${normalizedElimName}.png` : 'default.png';
-        eliminationLogoPath = `${baseLogoPath}${logoSeparator}${logoFileName}`;
-      }
+      if (eliminationTeamData) {
+        const eliminationTeamName =
+          eliminationTeamData.team_name ||
+          eliminationTeamData.original_team_name ||
+          eliminationTeamData.name ||
+          eliminationTeamData.teamName ||
+          'Unknown Team';
 
-      const eliminationKills =
-        Number.isFinite(Number(eliminatedTeamEntry.totalKills))
-          ? Number(eliminatedTeamEntry.totalKills)
-          : Number(eliminatedTeamEntry.kill_count) || 0;
+        const eliminationKills =
+          (Array.isArray(eliminationTeamData.player_stats)
+            ? eliminationTeamData.player_stats.reduce(
+                (sum, player) => sum + (Number(player.kills) || 0),
+                0
+              )
+            : 0) || Number(eliminationTeamData.kill_count) || 0;
 
-      jsonData.ELIMTEAM = eliminationTeamName;
-      jsonData.ELIMRANK = formattedRank;
-      jsonData.ELIMFIN = eliminationKills;
-      jsonData.ELIMLOGO = eliminationLogoPath;
+        let eliminationLogoPath = '';
+        if (baseLogoPath) {
+          const normalizedElimName = eliminationTeamName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+          const logoFileName = normalizedElimName ? `${normalizedElimName}.png` : 'default.png';
+          eliminationLogoPath = `${baseLogoPath}${logoSeparator}${logoFileName}`;
+        }
 
-      const eliminationPlayers = Array.isArray(eliminatedTeamEntry.player_stats)
-        ? eliminatedTeamEntry.player_stats
-        : [];
-      const playerSlots = Math.max(eliminationPlayers.length, 4);
+        jsonData.ELIMTEAM = eliminationTeamName;
+        jsonData.ELIMRANK =
+          eliminationRankValue !== undefined && eliminationRankValue !== null
+            ? String(eliminationRankValue)
+            : '';
+        jsonData.ELIMFIN = eliminationKills;
+        jsonData.ELIMLOGO = eliminationLogoPath;
 
-      for (let index = 0; index < playerSlots; index += 1) {
-        const playerImagePath = eliminationPlayers[index]
-          ? buildEliminationPlayerImagePath(eliminationTeamName, index)
-          : '';
-        jsonData[`ELIMP${index + 1}IMG`] = playerImagePath;
+        const playerCount = Array.isArray(eliminationTeamData.player_stats)
+          ? eliminationTeamData.player_stats.length
+          : 0;
+        const slotCount = Math.min(Math.max(playerCount, 1), 4);
+
+        for (let index = 0; index < slotCount; index += 1) {
+          const hasPlayer = index < playerCount;
+          const playerImagePath = hasPlayer
+            ? buildEliminationPlayerImagePath(eliminationTeamName, index)
+            : '';
+          jsonData[`ELIMP${index + 1}IMG`] = playerImagePath;
+        }
+
+        for (let index = slotCount; index < 4; index += 1) {
+          jsonData[`ELIMP${index + 1}IMG`] = '';
+        }
+      } else {
+        jsonData.ELIMTEAM = '';
+        jsonData.ELIMRANK = '';
+        jsonData.ELIMFIN = '';
+        jsonData.ELIMLOGO = '';
+        for (let index = 0; index < 4; index += 1) {
+          jsonData[`ELIMP${index + 1}IMG`] = '';
+        }
       }
     } else {
       jsonData.ELIMTEAM = '';
@@ -1595,6 +1595,11 @@ const LiveScoring = () => {
   };
   // NEW: Function to write JSON to file
   const writeJsonToFile = async () => {
+    if (!jsonFilePath.trim()) {
+      setJsonWriteStatus({ type: 'error', message: 'Please enter a file path' });
+      return;
+    }
+
     const jsonData = generateVmixJson();
     if (!jsonData) {
       setJsonWriteStatus({ type: 'error', message: 'No data available to write' });
@@ -1603,58 +1608,14 @@ const LiveScoring = () => {
 
     try {
       setJsonWriteStatus({ type: 'loading', message: 'Writing JSON file...' });
-
-      if (typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function') {
-        try {
-          const fileHandle = await window.showSaveFilePicker({
-            suggestedName: 'vmix-data.json',
-            types: [
-              {
-                description: 'JSON Files',
-                accept: { 'application/json': ['.json'] },
-              },
-            ],
-          });
-
-          const writable = await fileHandle.createWritable();
-          await writable.write(JSON.stringify(jsonData, null, 2));
-          await writable.close();
-
-          setJsonWriteStatus({
-            type: 'success',
-            message: `JSON saved to ${fileHandle.name || 'selected file'}.`,
-          });
-          return;
-        } catch (pickerError) {
-          if (pickerError?.name === 'AbortError') {
-            setJsonWriteStatus({ type: 'error', message: 'Save cancelled.' });
-            return;
-          }
-          console.error('File picker failed, falling back to server write:', pickerError);
-        }
-      }
-
-      let targetPath = (jsonFilePath || '').trim();
-      if (!targetPath) {
-        const userInput =
-          typeof window !== 'undefined'
-            ? window.prompt('Enter the full path where the JSON should be saved:', '')
-            : '';
-        if (!userInput) {
-          setJsonWriteStatus({ type: 'error', message: 'Save cancelled.' });
-          return;
-        }
-        targetPath = userInput.trim();
-        setJsonFilePath(targetPath);
-      }
-
+      
       const response = await fetch('/api/write-json', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          filePath: targetPath,
+          filePath: jsonFilePath,
           jsonData: jsonData,
         }),
       });
@@ -1689,7 +1650,7 @@ const LiveScoring = () => {
     hpFolderPath,
     zoneInImage,
     zoneOutImage,
-    eliminationImageBasePath,
+    eliminationHistory,
   ]);
 
   // Helper function to extract players/teams from data
@@ -3028,39 +2989,6 @@ const LiveScoring = () => {
 
             <div>
               <label className="block text-slate-200 text-sm font-semibold mb-3">
-                Elimination Player Images Base Path
-              </label>
-              <input
-                type="text"
-                value={eliminationImageBasePath}
-                onChange={(e) => setEliminationImageBasePath(e.target.value)}
-                placeholder="D:/Production Assets/TEAM PLAYER IMAGES"
-                className="w-full px-5 py-3 bg-slate-900/80 text-white rounded-xl border-2 border-slate-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500 transition-all shadow-lg font-mono text-sm mb-4"
-              />
-              <p className="text-slate-400 text-xs mb-4">
-                Players are loaded from folders matching the team name. Example:&nbsp;
-                D:/Production Assets/TEAM PLAYER IMAGES/TEAM NAME/1.png.
-              </p>
-            </div>
-
-            <div>
-              <label className="block text-slate-200 text-sm font-semibold mb-3">
-                vMix IP / Host (Elimination Animation)
-              </label>
-              <input
-                type="text"
-                value={vmixIpAddress}
-                onChange={(e) => setVmixIpAddress(e.target.value)}
-                placeholder="192.168.110.12:8088 or http://192.168.110.12:8088"
-                className="w-full px-5 py-3 bg-slate-900/80 text-white rounded-xl border-2 border-slate-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500 transition-all shadow-lg font-mono text-sm mb-4"
-              />
-              <p className="text-slate-400 text-xs mb-4">
-                Used to trigger ELIM title animations automatically when a team is eliminated.
-              </p>
-            </div>
-
-            <div>
-              <label className="block text-slate-200 text-sm font-semibold mb-3">
                 JSON File Path (Save Location)
               </label>
               <input
@@ -3165,7 +3093,7 @@ const LiveScoring = () => {
             
             <button
               onClick={writeJsonToFile}
-              disabled={!liveData}
+              disabled={!jsonFilePath.trim() || !liveData}
               className="w-full md:w-auto px-6 py-2.5 bg-gradient-to-r from-green-600 via-emerald-600 to-green-500 hover:from-green-500 hover:via-emerald-500 hover:to-green-400 text-white font-bold rounded-xl transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-xl hover:shadow-2xl hover:shadow-green-500/50 transform hover:scale-105 active:scale-95"
             >
               💾 Write JSON File (Manual)
