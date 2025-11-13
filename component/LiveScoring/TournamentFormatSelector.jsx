@@ -383,12 +383,9 @@ const TournamentFormatSelector = ({ format = 'linear', onFormatChange, roundRobi
     const updatedShort = parseLines(shortSource);
     const updatedFull = parseLines(fullSource);
 
-    const maxLength = Math.max(
-      safeConfig.teamsPerGroup,
-      baseGroup.teams?.length || 0,
-      updatedShort.length,
-      updatedFull.length
-    );
+    // Use the configured teamsPerGroup as the limit - don't auto-increase when typing names
+    // Only use as many teams as configured, but allow input to be longer (will be truncated)
+    const maxLength = safeConfig.teamsPerGroup;
 
     const teams = Array.from({ length: maxLength }, (_, index) => ({
       shortName: updatedShort[index] ?? '',
@@ -404,9 +401,10 @@ const TournamentFormatSelector = ({ format = 'linear', onFormatChange, roundRobi
         : group
     );
 
+    // Keep teamsPerGroup as user configured - don't auto-increase
     emitConfigUpdate({
       groupCount: safeConfig.groupCount,
-      teamsPerGroup: Math.max(safeConfig.teamsPerGroup, maxLength),
+      teamsPerGroup: safeConfig.teamsPerGroup,
       groups,
     });
   };

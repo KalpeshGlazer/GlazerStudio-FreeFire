@@ -345,12 +345,8 @@ const LiveScoring = () => {
         group.teams.forEach((teamEntry) => {
           if (teamEntry && typeof teamEntry === 'object') {
             const shortName = typeof teamEntry.shortName === 'string' ? teamEntry.shortName.trim() : '';
-            const fullName = typeof teamEntry.fullName === 'string' ? teamEntry.fullName.trim() : '';
             if (shortName) {
               pushOption(shortName);
-            }
-            if (fullName && fullName !== shortName) {
-              pushOption(fullName);
             }
           } else {
             pushOption(teamEntry);
@@ -1584,7 +1580,33 @@ const LiveScoring = () => {
 
       displayTeams = flattened;
     } else if (tournamentFormat === 'roundRobin') {
-      displayTeams = [...teamsWithStats].sort(compareByTotalPoints);
+      // In round robin overall mode, sort by points and assign ranks based on position
+      if (jsonGroupingMode === 'overall') {
+        displayTeams = [...teamsWithStats].sort(compareByTotalPoints);
+        // Assign competition ranking (same points = same rank)
+        let currentRank = 1;
+        displayTeams.forEach((team, index) => {
+          if (index > 0) {
+            const prevTeam = displayTeams[index - 1];
+            const prevTotal = Number.isFinite(prevTeam.combinedTotalPoints)
+              ? prevTeam.combinedTotalPoints
+              : Number(prevTeam.currentMatchTotalPoints) || 0;
+            const prevKills = Number(prevTeam.killPoints) || Number(prevTeam.totalKills) || 0;
+            const currentTotal = Number.isFinite(team.combinedTotalPoints)
+              ? team.combinedTotalPoints
+              : Number(team.currentMatchTotalPoints) || 0;
+            const currentKills = Number(team.killPoints) || Number(team.totalKills) || 0;
+            
+            // If points or kills differ, assign new rank
+            if (prevTotal !== currentTotal || prevKills !== currentKills) {
+              currentRank = index + 1;
+            }
+          }
+          team.overallRank = currentRank;
+        });
+      } else {
+        displayTeams = [...teamsWithStats].sort(compareByTotalPoints);
+      }
     } else {
       displayTeams = combinedRankedTeams;
     }
@@ -1678,6 +1700,9 @@ const LiveScoring = () => {
         if (team) {
           team.groupRank = nextRank;
         }
+      } else if (tournamentFormat === 'roundRobin' && jsonGroupingMode === 'overall' && hasTeamData && Number.isFinite(team.overallRank)) {
+        // In round robin overall mode, use the overallRank we just calculated
+        displayRank = team.overallRank;
       } else if (hasTeamData && Number.isFinite(team.overallRank)) {
         displayRank = team.overallRank;
       }
@@ -1765,12 +1790,38 @@ const LiveScoring = () => {
           eliminationLogoPath = `${baseLogoPath}${logoSeparator}${logoFileName}`;
         }
 
-        const eliminatedByName =
+        const eliminatedByNameRaw =
           eliminationTeamData.eliminated_team_name ||
           eliminationTeamData.eliminatedTeamName ||
           eliminationTeamData.eliminated_by ||
           eliminationTeamData.eliminatedBy ||
           '';
+
+        // Find the eliminating team and get its short name
+        let eliminatedByShortName = '';
+        if (eliminatedByNameRaw) {
+          const eliminatingTeam = combinedRankedTeams.find((team) => {
+            const teamName =
+              team.team_name ||
+              team.original_team_name ||
+              team.name ||
+              team.teamName ||
+              '';
+            return (
+              teamName.toLowerCase().trim() === eliminatedByNameRaw.toLowerCase().trim() ||
+              team.original_team_name?.toLowerCase().trim() === eliminatedByNameRaw.toLowerCase().trim()
+            );
+          });
+
+          if (eliminatingTeam) {
+            eliminatedByShortName =
+              eliminatingTeam.short_name ||
+              eliminatingTeam.shortName ||
+              eliminatedByNameRaw;
+          } else {
+            eliminatedByShortName = eliminatedByNameRaw;
+          }
+        }
 
         jsonData.ELIMTEAM = eliminationTeamName;
         jsonData.ELIMRANK =
@@ -1779,7 +1830,7 @@ const LiveScoring = () => {
             : '';
         jsonData.ELIMFIN = eliminationKills;
         jsonData.ELIMLOGO = eliminationLogoPath;
-        jsonData.ELIMBY = eliminatedByName || '';
+        jsonData.ELIMBY = eliminatedByShortName;
 
         const playerCount = Array.isArray(eliminationTeamData.player_stats)
           ? eliminationTeamData.player_stats.length
