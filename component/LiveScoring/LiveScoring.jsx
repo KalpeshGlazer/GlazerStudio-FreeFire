@@ -1084,6 +1084,19 @@ const LiveScoring = () => {
       setCurrentEliminationEntry(nextEntry);
       const shouldHoldDisplay = Number(nextEntry?.eliminationRank) === 2;
 
+      // Debug logging when 2 teams are left
+      if (shouldHoldDisplay) {
+        console.log('[ELIMINATION DEBUG] Last 2 teams - one eliminated:', {
+          eliminationRank: nextEntry?.eliminationRank,
+          teamKey: nextEntry?.key,
+          teamSnapshot: nextEntry?.teamSnapshot,
+          totalTeamsAtElimination: nextEntry?.totalTeamsAtElimination,
+        });
+      }
+
+      // Wait for JSON data to be written first (give it time to update)
+      await waitFor(500);
+
       let transitionInTriggered = false;
 
       if (transitionInUrl && !booyahAchievedRef.current) {
@@ -1095,7 +1108,7 @@ const LiveScoring = () => {
         }
       }
 
-      await waitFor(2000);
+      await waitFor(3000);
 
       if (transitionOutUrl && (transitionInTriggered || !booyahAchievedRef.current)) {
         try {
@@ -1761,6 +1774,18 @@ const LiveScoring = () => {
     if (latestEliminationEntry) {
       const eliminationKey = latestEliminationEntry.key;
       const eliminationRankValue = latestEliminationEntry.eliminationRank;
+      const isLastTwoTeams = Number(eliminationRankValue) === 2;
+
+      // Debug logging when 2 teams are left
+      if (isLastTwoTeams) {
+        console.log('[JSON DEBUG] Generating JSON for last 2 teams elimination:', {
+          eliminationKey,
+          eliminationRank: eliminationRankValue,
+          totalTeamsAtElimination: latestEliminationEntry.totalTeamsAtElimination,
+          teamSnapshot: latestEliminationEntry.teamSnapshot,
+          combinedRankedTeamsCount: combinedRankedTeams.length,
+        });
+      }
 
       const eliminationTeamData =
         combinedRankedTeams.find((team) => getTeamEliminationKey(team) === eliminationKey) ||
@@ -1768,6 +1793,13 @@ const LiveScoring = () => {
         null;
 
       if (eliminationTeamData) {
+        if (isLastTwoTeams) {
+          console.log('[JSON DEBUG] Elimination team data found:', {
+            teamName: eliminationTeamData.team_name || eliminationTeamData.original_team_name,
+            hasData: !!eliminationTeamData,
+            eliminatedBy: eliminationTeamData.eliminated_team_name || eliminationTeamData.eliminated_by,
+          });
+        }
         const eliminationTeamName =
           eliminationTeamData.team_name ||
           eliminationTeamData.original_team_name ||
@@ -1797,8 +1829,8 @@ const LiveScoring = () => {
           eliminationTeamData.eliminatedBy ||
           '';
 
-        // Find the eliminating team and get its short name
-        let eliminatedByShortName = '';
+        // Find the eliminating team and get its FULL name (not short name)
+        let eliminatedByFullName = '';
         if (eliminatedByNameRaw) {
           const eliminatingTeam = combinedRankedTeams.find((team) => {
             const teamName =
@@ -1814,12 +1846,15 @@ const LiveScoring = () => {
           });
 
           if (eliminatingTeam) {
-            eliminatedByShortName =
-              eliminatingTeam.short_name ||
-              eliminatingTeam.shortName ||
+            // Use full name, not short name
+            eliminatedByFullName =
+              eliminatingTeam.team_name ||
+              eliminatingTeam.original_team_name ||
+              eliminatingTeam.name ||
+              eliminatingTeam.teamName ||
               eliminatedByNameRaw;
           } else {
-            eliminatedByShortName = eliminatedByNameRaw;
+            eliminatedByFullName = eliminatedByNameRaw;
           }
         }
 
@@ -1830,7 +1865,19 @@ const LiveScoring = () => {
             : '';
         jsonData.ELIMFIN = eliminationKills;
         jsonData.ELIMLOGO = eliminationLogoPath;
-        jsonData.ELIMBY = eliminatedByShortName;
+        jsonData.ELIMBY = eliminatedByFullName;
+
+        // Debug logging when 2 teams are left - show what's being set in JSON
+        if (isLastTwoTeams) {
+          console.log('[JSON DEBUG] ELIM data set in JSON:', {
+            ELIMTEAM: jsonData.ELIMTEAM,
+            ELIMRANK: jsonData.ELIMRANK,
+            ELIMBY: jsonData.ELIMBY,
+            ELIMFIN: jsonData.ELIMFIN,
+            eliminatedByFullName,
+            eliminationTeamName,
+          });
+        }
 
         const playerCount = Array.isArray(eliminationTeamData.player_stats)
           ? eliminationTeamData.player_stats.length
@@ -1849,6 +1896,16 @@ const LiveScoring = () => {
           jsonData[`ELIMP${index + 1}IMG`] = '';
         }
       } else {
+        // Debug logging when elimination team data is not found
+        if (isLastTwoTeams) {
+          console.log('[JSON DEBUG] Elimination team data NOT found:', {
+            eliminationKey,
+            eliminationRank: eliminationRankValue,
+            combinedRankedTeamsCount: combinedRankedTeams.length,
+            teamSnapshot: latestEliminationEntry.teamSnapshot,
+            'combinedRankedTeams keys': combinedRankedTeams.map((t) => getTeamEliminationKey(t)),
+          });
+        }
         jsonData.ELIMTEAM = '';
         jsonData.ELIMRANK = '';
         jsonData.ELIMFIN = '';
