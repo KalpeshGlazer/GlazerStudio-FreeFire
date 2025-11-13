@@ -321,6 +321,7 @@ const LiveScoring = () => {
   const eliminationAnimationTimeoutsRef = useRef(new Set());
   const isComponentMountedRef = useRef(true);
   const booyahAchievedRef = useRef(false);
+  const lastEliminationEntryRef = useRef(null); // Store last elimination entry (rank 2) for JSON after booyah
   const sourceTeams = useMemo(() => extractTeams(liveData), [liveData]);
   const roundRobinTeamOptions = useMemo(() => {
     const seen = new Set();
@@ -936,12 +937,14 @@ const LiveScoring = () => {
   useEffect(() => {
     eliminatedTeamKeysRef.current = new Set();
     setEliminationHistory([]);
+    lastEliminationEntryRef.current = null; // Clear stored last elimination entry on new match
   }, [matchId]);
 
   useEffect(() => {
     if (liveData === null) {
       eliminatedTeamKeysRef.current = new Set();
       setEliminationHistory([]);
+      lastEliminationEntryRef.current = null; // Clear stored last elimination entry when data is cleared
     }
   }, [liveData]);
 
@@ -1084,6 +1087,15 @@ const LiveScoring = () => {
       setCurrentEliminationEntry(nextEntry);
       const shouldHoldDisplay = Number(nextEntry?.eliminationRank) === 2;
 
+      // Store the last elimination entry (rank 2) for JSON after booyah
+      if (shouldHoldDisplay && nextEntry) {
+        lastEliminationEntryRef.current = {
+          ...nextEntry,
+          storedAt: Date.now(),
+        };
+        console.log('[ELIMINATION DEBUG] Stored last elimination entry (rank 2):', lastEliminationEntryRef.current);
+      }
+
       // Debug logging when 2 teams are left
       if (shouldHoldDisplay) {
         console.log('[ELIMINATION DEBUG] Last 2 teams - one eliminated:', {
@@ -1207,6 +1219,15 @@ const LiveScoring = () => {
         eliminatedAt: Date.now(),
         teamSnapshot,
       };
+
+      // Store the last elimination entry (rank 2) for JSON after booyah
+      if (eliminationRank === 2) {
+        lastEliminationEntryRef.current = {
+          ...eliminationEntry,
+          storedAt: Date.now(),
+        };
+        console.log('[ELIMINATION DEBUG] Stored last elimination entry (rank 2) in handleTeamElimination:', lastEliminationEntryRef.current);
+      }
 
       setEliminationHistory((prev) => [...prev, eliminationEntry]);
       enqueueEliminationAnimation(eliminationEntry);
@@ -1769,7 +1790,14 @@ const LiveScoring = () => {
       });
     });
 
-    const latestEliminationEntry = currentEliminationEntry;
+    // Use current elimination entry, or fallback to stored last elimination entry (rank 2) after booyah
+    let latestEliminationEntry = currentEliminationEntry;
+    
+    // If no current entry but booyah is achieved, use stored last elimination entry
+    if (!latestEliminationEntry && booyahAchievedRef.current && lastEliminationEntryRef.current) {
+      latestEliminationEntry = lastEliminationEntryRef.current;
+      console.log('[JSON DEBUG] Using stored last elimination entry after booyah:', latestEliminationEntry);
+    }
 
     if (latestEliminationEntry) {
       const eliminationKey = latestEliminationEntry.key;
