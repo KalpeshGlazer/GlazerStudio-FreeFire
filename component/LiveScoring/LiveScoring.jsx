@@ -200,6 +200,311 @@ const resolveTeamShortName = (team, index = 0) => {
 
   return `Team ${Number.isFinite(index) ? index + 1 : index || 1}`;
 };
+
+const normalizePlayerId = (value) => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(Math.trunc(value));
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed || null;
+  }
+
+  try {
+    const serialized = String(value).trim();
+    return serialized || null;
+  } catch {
+    return null;
+  }
+};
+
+const resolvePlayerStatId = (player) => {
+  if (!player || typeof player !== 'object') {
+    return null;
+  }
+
+  const candidateKeys = [
+    'player_id',
+    'playerId',
+    'profile_id',
+    'profileId',
+    'account_id',
+    'accountId',
+    'user_id',
+    'userId',
+    'character_id',
+    'characterId',
+    'id',
+  ];
+
+  for (const key of candidateKeys) {
+    const directValue = player[key];
+    const normalizedDirect = normalizePlayerId(directValue);
+    if (normalizedDirect) {
+      return normalizedDirect;
+    }
+
+    if (player.raw && typeof player.raw === 'object') {
+      const rawValue = player.raw[key];
+      const normalizedRaw = normalizePlayerId(rawValue);
+      if (normalizedRaw) {
+        return normalizedRaw;
+      }
+    }
+  }
+
+  return null;
+};
+
+const deriveTeamMappingEntries = (payload) => {
+  if (!payload || typeof payload !== 'object') {
+    return [];
+  }
+
+  if (Array.isArray(payload)) {
+    return payload.map((entry, index) => [`team-${index + 1}`, entry]);
+  }
+
+  const candidateContainers = [
+    payload.PlayerNameList,
+    payload.playerNameList,
+    payload.Teams,
+    payload.teams,
+    payload.TeamList,
+    payload.teamList,
+  ];
+
+  for (const container of candidateContainers) {
+    if (!container) continue;
+    if (Array.isArray(container)) {
+      return container.map((entry, index) => {
+        const inferredKey =
+          (entry && (entry.ShortName || entry.shortName || entry.LongName || entry.longName)) ||
+          `team-${index + 1}`;
+        return [inferredKey, entry];
+      });
+    }
+    if (typeof container === 'object') {
+      return Object.entries(container);
+    }
+  }
+
+  return Object.entries(payload);
+};
+
+const parseTeamMappingPayload = (payload = {}) => {
+  const entries = deriveTeamMappingEntries(payload);
+  if (!entries.length) {
+    throw new Error('No teams were found in the uploaded JSON file.');
+  }
+
+  const teamsByKey = {};
+  const playersById = {};
+
+  entries.forEach(([entryKey, rawTeam], index) => {
+    if (!rawTeam || typeof rawTeam !== 'object') {
+      return;
+    }
+
+    const shortName =
+      (typeof rawTeam.ShortName === 'string' && rawTeam.ShortName.trim()) ||
+      (typeof rawTeam.shortName === 'string' && rawTeam.shortName.trim()) ||
+      '';
+    const longName =
+      (typeof rawTeam.LongName === 'string' && rawTeam.LongName.trim()) ||
+      (typeof rawTeam.longName === 'string' && rawTeam.longName.trim()) ||
+      shortName;
+    const groupLabel = sanitizeGroupName(
+      rawTeam.Group ||
+        rawTeam.group ||
+        rawTeam.groupName ||
+        rawTeam.GroupName ||
+        ''
+    );
+    const groupKey = groupLabel ? normalizeGroupKey(groupLabel) : null;
+
+    const playersArray = Array.isArray(rawTeam.Players)
+      ? rawTeam.Players
+      : Array.isArray(rawTeam.players)
+      ? rawTeam.players
+      : [];
+
+    const normalizedPlayers = playersArray
+      .map((playerEntry, playerIndex) => {
+        if (!playerEntry || typeof playerEntry !== 'object') {
+          return null;
+        }
+        const playerId =
+          normalizePlayerId(
+            playerEntry.PlayerID ??
+              playerEntry.playerID ??
+              playerEntry.playerId ??
+              playerEntry.player_id ??
+              playerEntry.AccountID ??
+              playerEntry.account_id ??
+              playerEntry.accountId ??
+              playerEntry.Id ??
+              playerEntry.id
+          ) || null;
+        if (!playerId) {
+          return null;
+        }
+
+        const displayNameCandidate =
+          (typeof playerEntry.PlayerNameOverwrite === 'string' &&
+            playerEntry.PlayerNameOverwrite.trim()) ||
+          (typeof playerEntry.PlayerName === 'string' && playerEntry.PlayerName.trim()) ||
+          (typeof playerEntry.Name === 'string' && playerEntry.Name.trim()) ||
+          '';
+
+        return {
+          slotIndex: playerIndex,
+          playerId,
+          displayName: displayNameCandidate,
+          raw: playerEntry,
+        };
+      })
+      .filter(Boolean);
+
+    const inferredKey =
+      (typeof entryKey === 'string' && entryKey.trim()) ||
+      shortName ||
+      longName ||
+      `team-${index + 1}`;
+
+    const normalizedKey = inferredKey.trim();
+
+    teamsByKey[normalizedKey] = {
+      key: normalizedKey,
+      shortName,
+      longName,
+      groupName: groupLabel || '',
+      groupKey,
+      players: normalizedPlayers,
+      raw: rawTeam,
+    };
+
+    normalizedPlayers.forEach((slotEntry) => {
+      playersById[slotEntry.playerId] = {
+        teamKey: normalizedKey,
+        slotIndex: slotEntry.slotIndex,
+        displayName: slotEntry.displayName,
+        shortName,
+        longName,
+        groupKey,
+        groupName: groupLabel || '',
+      };
+    });
+  });
+
+  const teamCount = Object.keys(teamsByKey).length;
+  const playerCount = Object.keys(playersById).length;
+
+  if (!teamCount) {
+    throw new Error('The uploaded JSON does not contain any valid teams.');
+  }
+  if (!playerCount) {
+    throw new Error('No player IDs were found in the uploaded team JSON.');
+  }
+
+  return {
+    uploadedAt: new Date().toISOString(),
+    teamCount,
+    playerCount,
+    teamsByKey,
+    playersById,
+  };
+};
+
+const reorderTeamPlayersByMapping = (playerStats = [], teamMeta = null, persistentSlotMap = null) => {
+  if (
+    !Array.isArray(playerStats) ||
+    !playerStats.length ||
+    !teamMeta ||
+    !Array.isArray(teamMeta.players) ||
+    !teamMeta.players.length
+  ) {
+    return playerStats;
+  }
+
+  const playersById = new Map();
+  playerStats.forEach((player) => {
+    const playerId = resolvePlayerStatId(player);
+    if (playerId) {
+      playersById.set(playerId, player);
+    }
+  });
+
+  if (!playersById.size) {
+    return playerStats;
+  }
+
+  // Use persistent slot mapping if available, otherwise use JSON mapping
+  let slotOrder = null;
+  if (persistentSlotMap && persistentSlotMap.size > 0) {
+    // Build ordered slots from persistent mapping
+    const sortedSlots = Array.from(persistentSlotMap.entries())
+      .sort((a, b) => a[1] - b[1]) // Sort by slot index
+      .map(([playerId]) => ({ playerId, slotIndex: persistentSlotMap.get(playerId) }));
+    slotOrder = slotOrder || sortedSlots;
+  } else {
+    // Use JSON mapping order
+    slotOrder = teamMeta.players;
+  }
+
+  const consumedIds = new Set();
+  const orderedSlots = slotOrder.map((slotEntry) => {
+    const matchedPlayer = slotEntry.playerId ? playersById.get(slotEntry.playerId) : null;
+    if (!matchedPlayer) {
+      return null;
+    }
+
+    consumedIds.add(slotEntry.playerId);
+    const displayName =
+      slotEntry.displayName ||
+      matchedPlayer.nickname ||
+      matchedPlayer.player_name ||
+      matchedPlayer.playerName ||
+      matchedPlayer.name ||
+      matchedPlayer.id ||
+      '';
+
+    return {
+      ...matchedPlayer,
+      nickname: displayName || matchedPlayer.nickname || matchedPlayer.playerName,
+      mappedPlayerName: displayName,
+      mappedSlotIndex: slotEntry.slotIndex,
+    };
+  });
+
+  const leftovers = playerStats.filter((player) => {
+    const identifier = resolvePlayerStatId(player);
+    if (!identifier) {
+      return true;
+    }
+    return !consumedIds.has(identifier);
+  });
+
+  let leftoverPointer = 0;
+  for (let idx = 0; idx < orderedSlots.length && leftoverPointer < leftovers.length; idx += 1) {
+    if (!orderedSlots[idx]) {
+      orderedSlots[idx] = leftovers[leftoverPointer];
+      leftoverPointer += 1;
+    }
+  }
+
+  while (leftoverPointer < leftovers.length) {
+    orderedSlots.push(leftovers[leftoverPointer]);
+    leftoverPointer += 1;
+  }
+
+  return orderedSlots.filter(Boolean);
+};
 const ROUND_ROBIN_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 const UNASSIGNED_GROUP_KEY = '__unassigned__';
 
@@ -332,6 +637,8 @@ const LiveScoring = () => {
   const [tournamentFormat, setTournamentFormat] = useState('linear');
   const [roundRobinConfig, setRoundRobinConfig] = useState(() => createDefaultRoundRobinConfig());
   const [configTransferStatus, setConfigTransferStatus] = useState(null);
+  const [teamMappingConfig, setTeamMappingConfig] = useState(null);
+  const [teamMappingUploadStatus, setTeamMappingUploadStatus] = useState(null);
   const configFileInputRef = useRef(null);
   const eliminatedTeamKeysRef = useRef(new Set());
   const eliminationAnimationQueueRef = useRef([]);
@@ -340,6 +647,7 @@ const LiveScoring = () => {
   const isComponentMountedRef = useRef(true);
   const booyahAchievedRef = useRef(false);
   const lastEliminationEntryRef = useRef(null); // Store last elimination entry (rank 2) for JSON after booyah
+  const playerSlotMappingRef = useRef(new Map()); // Persistent mapping: teamKey -> Map<playerId -> slotIndex>
   const sourceTeams = useMemo(() => extractTeams(liveData), [liveData]);
   const roundRobinTeamOptions = useMemo(() => {
     const seen = new Set();
@@ -1861,8 +2169,11 @@ const LiveScoring = () => {
       const manualName = manualTeamSlots[position] || '';
       const fullTeamName = team ? team.team_name || `Team ${position}` : manualName;
       const shortTeamName = team
-        ? team.short_name || team.shortName || fullTeamName
+        ? team.display_short_name || team.short_name || team.shortName || ''
         : manualName;
+      const resolvedShortName = shortTeamName && shortTeamName.trim()
+        ? shortTeamName.trim()
+        : fullTeamName;
       const teamName = shortTeamName || fullTeamName;
       const hasTeamData = Boolean(team) && !team.manualPlaceholder;
 
@@ -1971,6 +2282,7 @@ const LiveScoring = () => {
         position,
         teamName,
         teamFullName: fullTeamName,
+        resolvedShortName,
         rank: `#${displayRank}`,
         logoPath,
         finValue,
@@ -1984,8 +2296,8 @@ const LiveScoring = () => {
     });
 
     // Maintain JSON key order: Teams, Ranks, Logos, FIN, TOTAL, ZONE, WINRATE, HP entries
-    slots.forEach(({ position, teamName }) => {
-      jsonData[`Team${position}`] = teamName;
+    slots.forEach(({ position, resolvedShortName }) => {
+      jsonData[`Team${position}`] = resolvedShortName;
     });
 
     slots.forEach(({ position, rank }) => {
@@ -2495,22 +2807,73 @@ const LiveScoring = () => {
     });
   };
 
+  const resolveUploadedTeamMeta = useCallback(
+    (team) => {
+      if (
+        !teamMappingConfig ||
+        !teamMappingConfig.playersById ||
+        !teamMappingConfig.teamsByKey
+      ) {
+        return null;
+      }
+
+      const players = Array.isArray(team?.player_stats) ? team.player_stats : [];
+      if (!players.length) {
+        return null;
+      }
+
+      const voteMap = new Map();
+      const matchedPlayerIds = [];
+      
+      players.forEach((player) => {
+        const playerId = resolvePlayerStatId(player);
+        if (!playerId) return;
+        const mapping = teamMappingConfig.playersById[playerId];
+        if (!mapping || !mapping.teamKey) return;
+        matchedPlayerIds.push(playerId);
+        voteMap.set(mapping.teamKey, (voteMap.get(mapping.teamKey) || 0) + 1);
+      });
+
+      if (!voteMap.size) {
+        return null;
+      }
+
+      const sortedVotes = Array.from(voteMap.entries()).sort((a, b) => b[1] - a[1]);
+      const bestKey = sortedVotes[0]?.[0];
+      if (!bestKey) {
+        return null;
+      }
+
+      const matchedTeam = teamMappingConfig.teamsByKey[bestKey];
+      if (matchedTeam) {
+        console.log('[Team Auto-Mapping] Matched team by player IDs:', {
+          apiTeamName: team?.team_name || team?.original_team_name,
+          jsonShortName: matchedTeam.shortName,
+          jsonLongName: matchedTeam.longName,
+          matchedPlayerIds,
+          matchCount: sortedVotes[0]?.[1],
+        });
+      }
+
+      return matchedTeam || null;
+    },
+    [teamMappingConfig]
+  );
+
   const getFilteredTeams = () => {
     const allTeams = extractTeams(liveData);
 
     const normalizedTeams = Array.isArray(allTeams) ? allTeams : [];
 
     const mappedTeams = normalizedTeams.map((team, index) => {
+      const uploadedMeta = resolveUploadedTeamMeta(team);
+
       const baseName = resolveTeamBaseName(team, index);
       const key = normalizeTeamNameKey(baseName);
       const overrideValue =
         key && typeof teamNameOverrides[key] === 'string' ? teamNameOverrides[key] : '';
       const shortOverride =
         key && typeof teamShortNameOverrides?.[key] === 'string' ? teamShortNameOverrides[key] : '';
-      const finalName =
-        typeof overrideValue === 'string' && overrideValue.trim().length > 0
-          ? overrideValue.trim()
-          : baseName;
       const existingShort =
         (typeof team?.short_name === 'string' && team.short_name.trim().length > 0
           ? team.short_name.trim()
@@ -2518,16 +2881,69 @@ const LiveScoring = () => {
         (typeof team?.shortName === 'string' && team.shortName.trim().length > 0
           ? team.shortName.trim()
           : null);
-      const resolvedShortName = (() => {
-        const trimmedOverride = typeof shortOverride === 'string' ? shortOverride.trim() : '';
-        if (trimmedOverride) {
-          return trimmedOverride;
+      const trimmedOverride = typeof overrideValue === 'string' ? overrideValue.trim() : '';
+      const trimmedShortOverride = typeof shortOverride === 'string' ? shortOverride.trim() : '';
+
+      let finalName = trimmedOverride || baseName;
+      if (!trimmedOverride && uploadedMeta) {
+        const preferred =
+          (typeof uploadedMeta.longName === 'string' && uploadedMeta.longName.trim()) ||
+          (typeof uploadedMeta.shortName === 'string' && uploadedMeta.shortName.trim()) ||
+          '';
+        if (preferred) {
+          finalName = preferred;
+        }
+      }
+
+      let resolvedShortName = (() => {
+        if (trimmedShortOverride) {
+          return trimmedShortOverride;
+        }
+        if (uploadedMeta && typeof uploadedMeta.shortName === 'string' && uploadedMeta.shortName.trim()) {
+          return uploadedMeta.shortName.trim();
         }
         if (existingShort) {
           return existingShort;
         }
         return resolveTeamShortName(team, index) || baseName;
       })();
+
+      const safePlayerStats = Array.isArray(team.player_stats) ? team.player_stats : [];
+      
+      // Maintain persistent slot mapping for consistent player positions
+      let persistentSlotMap = null;
+      if (uploadedMeta && uploadedMeta.key) {
+        const teamKey = uploadedMeta.key;
+        if (!playerSlotMappingRef.current.has(teamKey)) {
+          // First time matching this team - create and store the slot mapping
+          const newSlotMap = new Map();
+          if (Array.isArray(uploadedMeta.players)) {
+            uploadedMeta.players.forEach((slotEntry) => {
+              if (slotEntry.playerId && typeof slotEntry.slotIndex === 'number') {
+                newSlotMap.set(slotEntry.playerId, slotEntry.slotIndex);
+              }
+            });
+          }
+          if (newSlotMap.size > 0) {
+            playerSlotMappingRef.current.set(teamKey, newSlotMap);
+            console.log('[Player Slot Mapping] Created persistent mapping for team:', {
+              teamKey,
+              shortName: uploadedMeta.shortName,
+              slotCount: newSlotMap.size,
+            });
+          }
+        }
+        persistentSlotMap = playerSlotMappingRef.current.get(teamKey);
+      }
+      
+      const reorderedPlayers = uploadedMeta
+        ? reorderTeamPlayersByMapping(safePlayerStats, uploadedMeta, persistentSlotMap)
+        : safePlayerStats;
+
+      const resolvedGroupKey =
+        uploadedMeta?.groupKey ?? team.groupKey ?? team.raw?.groupKey ?? null;
+      const resolvedGroupName =
+        uploadedMeta?.groupName ?? team.groupName ?? team.raw?.groupName ?? null;
 
       return {
         ...team,
@@ -2540,6 +2956,12 @@ const LiveScoring = () => {
         original_team_name: baseName,
         short_name: resolvedShortName,
         shortName: resolvedShortName,
+        display_full_name: finalName,
+        display_short_name: resolvedShortName,
+        player_stats: reorderedPlayers,
+        groupKey: resolvedGroupKey,
+        groupName: resolvedGroupName,
+        uploadedTeamKey: uploadedMeta?.key || team.uploadedTeamKey,
       };
     });
 
@@ -2598,6 +3020,130 @@ const LiveScoring = () => {
 
     return [...mappedTeams, ...manualEntries];
   };
+  useEffect(() => {
+    if (!teamMappingConfig || !liveData) {
+      return;
+    }
+
+    const rawTeams = extractTeams(liveData);
+    if (!Array.isArray(rawTeams) || rawTeams.length === 0) {
+      return;
+    }
+
+    const desiredNameOverrides = {};
+    const desiredShortOverrides = {};
+
+    rawTeams.forEach((team, index) => {
+      const uploadedMeta = resolveUploadedTeamMeta(team);
+      if (!uploadedMeta) {
+        return;
+      }
+
+      const baseName = resolveTeamBaseName(team, index);
+      const key = normalizeTeamNameKey(baseName);
+      if (!key) {
+        return;
+      }
+
+      // When player IDs match, always use JSON mapping (overwrite existing values)
+      const preferredLong =
+        (typeof uploadedMeta.longName === 'string' && uploadedMeta.longName.trim()) ||
+        (typeof uploadedMeta.shortName === 'string' && uploadedMeta.shortName.trim()) ||
+        '';
+      if (preferredLong) {
+        desiredNameOverrides[key] = preferredLong;
+      }
+
+      if (typeof uploadedMeta.shortName === 'string' && uploadedMeta.shortName.trim()) {
+        desiredShortOverrides[key] = uploadedMeta.shortName.trim();
+      }
+    });
+
+    // Always apply JSON mappings when player IDs match (overwrite existing overrides)
+    if (Object.keys(desiredNameOverrides).length > 0) {
+      setTeamNameOverrides((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        Object.entries(desiredNameOverrides).forEach(([key, value]) => {
+          // Always update with JSON mapping when player IDs match
+          if (next[key] !== value) {
+            next[key] = value;
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
+      });
+    }
+
+    if (Object.keys(desiredShortOverrides).length > 0) {
+      setTeamShortNameOverrides((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        Object.entries(desiredShortOverrides).forEach(([key, value]) => {
+          // Always update with JSON mapping when player IDs match
+          if (next[key] !== value) {
+            next[key] = value;
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
+      });
+    }
+  }, [teamMappingConfig, liveData, resolveUploadedTeamMeta]);
+
+  // Clear slot mappings when team mapping config changes (new JSON uploaded)
+  useEffect(() => {
+    if (teamMappingConfig) {
+      // Keep existing mappings - they will be updated as teams are matched
+      // Only clear if config is removed
+    } else {
+      // Clear all mappings when config is removed
+      playerSlotMappingRef.current.clear();
+      console.log('[Player Slot Mapping] Cleared all slot mappings');
+    }
+  }, [teamMappingConfig]);
+
+  useEffect(() => {
+    if (!teamMappingConfig || !teamMappingConfig.teamsByKey) {
+      return;
+    }
+
+    const rosterEntries = Object.values(teamMappingConfig.teamsByKey).filter(
+      (teamEntry) =>
+        teamEntry &&
+        typeof teamEntry === 'object' &&
+        typeof teamEntry.shortName === 'string' &&
+        teamEntry.shortName.trim()
+    );
+
+    if (!rosterEntries.length) {
+      return;
+    }
+
+    const nextShortNames = rosterEntries.map((teamEntry) => teamEntry.shortName.trim()).join('\n');
+    const nextFullNames = rosterEntries
+      .map((teamEntry) => {
+        const preferred =
+          (typeof teamEntry.longName === 'string' && teamEntry.longName.trim()) ||
+          teamEntry.shortName.trim();
+        return preferred;
+      })
+      .join('\n');
+
+    setCustomShortNamesInput((prev) => {
+      if (prev && prev.trim().length > 0) {
+        return prev;
+      }
+      return nextShortNames;
+    });
+
+    setCustomFullNamesInput((prev) => {
+      if (prev && prev.trim().length > 0) {
+        return prev;
+      }
+      return nextFullNames;
+    });
+  }, [teamMappingConfig]);
 
   // NEW: Helper function to get logo path for a team
   const getTeamLogoPath = (teamName) => {
@@ -3308,6 +3854,65 @@ const LiveScoring = () => {
     event.target.value = '';
   };
 
+  const handleTeamMappingUpload = (event) => {
+    const input = event.target;
+    const file = input.files?.[0];
+    if (!file) return;
+
+    setTeamMappingUploadStatus({
+      type: 'loading',
+      message: `Reading ${file.name}...`,
+    });
+
+    const reader = new FileReader();
+
+    reader.onload = (uploadEvent) => {
+      try {
+        const fileContent = uploadEvent.target?.result;
+        if (!fileContent || typeof fileContent !== 'string') {
+          throw new Error('Invalid file content');
+        }
+
+        const parsed = JSON.parse(fileContent);
+        const normalized = parseTeamMappingPayload(parsed);
+
+        setTeamMappingConfig({
+          ...normalized,
+          sourceFileName: file.name,
+        });
+
+        setTeamMappingUploadStatus({
+          type: 'success',
+          message: `Loaded ${normalized.teamCount} team(s) and ${normalized.playerCount} player(s).`,
+        });
+      } catch (err) {
+        console.error('Failed to parse team mapping file:', err);
+        setTeamMappingConfig(null);
+        setTeamMappingUploadStatus({
+          type: 'error',
+          message: err?.message || 'Unable to parse the uploaded file.',
+        });
+      } finally {
+        if (input) {
+          input.value = '';
+        }
+      }
+    };
+
+    reader.onerror = (err) => {
+      console.error('Failed to read team mapping file:', err);
+      setTeamMappingUploadStatus({
+        type: 'error',
+        message: 'Unable to read the selected file.',
+      });
+      if (input) {
+        input.value = '';
+      }
+    };
+
+    reader.readAsText(file);
+  };
+
  
   const teams = getFilteredTeams();
   const scoringData = extractScoringData(liveData);
@@ -3548,6 +4153,30 @@ const LiveScoring = () => {
     Array.isArray(roundRobinTeamOptions) &&
     roundRobinTeamOptions.length > 0;
 
+  const rosterShortNameOptions = useMemo(() => {
+    if (!teamMappingConfig || !teamMappingConfig.teamsByKey) {
+      return [];
+    }
+
+    const seen = new Set();
+    const options = [];
+
+    Object.values(teamMappingConfig.teamsByKey).forEach((teamEntry) => {
+      if (!teamEntry || typeof teamEntry !== 'object') {
+        return;
+      }
+      const shortName =
+        typeof teamEntry.shortName === 'string' ? teamEntry.shortName.trim() : '';
+      if (!shortName || seen.has(shortName)) {
+        return;
+      }
+      seen.add(shortName);
+      options.push(shortName);
+    });
+
+    return options.sort((a, b) => a.localeCompare(b));
+  }, [teamMappingConfig]);
+
   const customNamePairs = useMemo(() => {
     const shortLines = customShortNamesInput
       .split(/\r?\n/)
@@ -3589,6 +4218,29 @@ const LiveScoring = () => {
     return map;
   }, [customNamePairs]);
 
+  const uploadedShortToFullMap = useMemo(() => {
+    if (!teamMappingConfig || !teamMappingConfig.teamsByKey) {
+      return {};
+    }
+    const map = {};
+    Object.values(teamMappingConfig.teamsByKey).forEach((teamEntry) => {
+      if (!teamEntry || typeof teamEntry !== 'object') {
+        return;
+      }
+      const shortName =
+        typeof teamEntry.shortName === 'string' ? teamEntry.shortName.trim() : '';
+      if (!shortName) {
+        return;
+      }
+      const fullName =
+        (typeof teamEntry.longName === 'string' && teamEntry.longName.trim()) ||
+        shortName;
+      map[shortName] = fullName;
+      map[shortName.toLowerCase()] = fullName;
+    });
+    return map;
+  }, [teamMappingConfig]);
+
   const linearShortNameOptions = useMemo(() => {
     const seen = new Set();
     const options = [];
@@ -3601,10 +4253,11 @@ const LiveScoring = () => {
       options.push(trimmed);
     };
 
+    rosterShortNameOptions.forEach(addOption);
     customNamePairs.forEach(({ shortName }) => addOption(shortName));
 
     return options.sort((a, b) => a.localeCompare(b));
-  }, [customNamePairs]);
+  }, [customNamePairs, rosterShortNameOptions]);
 
   const renderTeamNameControl = ({
     baseName,
@@ -3800,10 +4453,11 @@ const LiveScoring = () => {
 
   const combinedShortToFullMap = useMemo(() => {
     return {
+      ...uploadedShortToFullMap,
       ...roundRobinShortToFullMap,
       ...customShortToFullMap,
     };
-  }, [roundRobinShortToFullMap, customShortToFullMap]);
+  }, [uploadedShortToFullMap, roundRobinShortToFullMap, customShortToFullMap]);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 p-4 md:p-8 relative overflow-hidden">
@@ -4533,6 +5187,63 @@ const LiveScoring = () => {
               Left column shows the team names fetched from the match. Enter your preferred display name on the right.
             </p>
           </div>
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-5">
+            <div>
+              <p className="text-slate-300 text-xs font-semibold uppercase tracking-wider">
+                Upload roster JSON
+              </p>
+              <p className="text-slate-500 text-xs mt-1">
+                Map official team short/long names and lock player slots by Player ID for every match.
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <label
+                htmlFor="team-mapping-upload"
+                className="inline-flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-blue-600 via-blue-500 to-cyan-500 hover:from-blue-500 hover:via-blue-400 hover:to-cyan-400 text-white text-sm font-semibold rounded-xl cursor-pointer shadow-lg transition-all"
+              >
+                📁 Upload team JSON
+              </label>
+              <input
+                id="team-mapping-upload"
+                type="file"
+                accept="application/json,.json"
+                onChange={handleTeamMappingUpload}
+                className="hidden"
+              />
+            </div>
+          </div>
+          {teamMappingUploadStatus && (
+            <div
+              className={`px-4 py-3 rounded-xl text-xs font-semibold mb-4 border-2 ${
+                teamMappingUploadStatus.type === 'success'
+                  ? 'bg-green-900/40 border-green-600/60 text-green-100'
+                  : teamMappingUploadStatus.type === 'error'
+                  ? 'bg-red-900/40 border-red-600/60 text-red-100'
+                  : 'bg-blue-900/40 border-blue-600/60 text-blue-100'
+              }`}
+            >
+              {teamMappingUploadStatus.message}
+            </div>
+          )}
+          {teamMappingConfig && (
+            <p className="text-slate-400 text-xs font-medium mb-5">
+              Loaded{' '}
+              <span className="text-slate-100 font-semibold">
+                {teamMappingConfig.teamCount} team(s)
+              </span>{' '}
+              with{' '}
+              <span className="text-slate-100 font-semibold">
+                {teamMappingConfig.playerCount} player mapping(s)
+              </span>
+              {teamMappingConfig.sourceFileName ? (
+                <>
+                  {' '}
+                  from <span className="text-slate-200">{teamMappingConfig.sourceFileName}</span>
+                </>
+              ) : null}
+              .
+            </p>
+          )}
           {tournamentFormat === 'roundRobin' &&
             Array.isArray(roundRobinConfig?.groups) &&
             roundRobinConfig.groups.length > 0 && (
